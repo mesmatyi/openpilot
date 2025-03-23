@@ -14,21 +14,19 @@ class LatControlLQR(LatControl):
     self.mpc_frame = 0
     self.params = Params()
 
-    self.scale = CP.lateralTuning.lqr.scale
-    self.ki = CP.lateralTuning.lqr.ki
+    self.scale = 1700.0
+    self.ki = 0.01
 
-    self.A = np.array(CP.lateralTuning.lqr.a).reshape((2, 2))
-    self.B = np.array(CP.lateralTuning.lqr.b).reshape((2, 1))
-    self.C = np.array(CP.lateralTuning.lqr.c).reshape((1, 2))
-    self.K = np.array(CP.lateralTuning.lqr.k).reshape((1, 2))
-    self.L = np.array(CP.lateralTuning.lqr.l).reshape((2, 1))
-    self.dc_gain = CP.lateralTuning.lqr.dcGain
+    self.A = np.array([0.,1.,-0.2261, 1.2182]).reshape((2, 2))
+    self.B = np.array([-1.92,3.95]).reshape((2, 1))
+    self.C = np.array([1.,0.]).reshape((1, 2))
+    self.K = np.array([-110.73,451.22]).reshape((1, 2))
+    self.L = np.array([0.32,0.31]).reshape((2, 1))
+    self.dc_gain = 0.0027
 
     self.x_hat = np.array([[0], [0]])
     self.i_unwind_rate = 0.3 * DT_CTRL
     self.i_rate = 1.0 * DT_CTRL
-
-    self.live_tune_enabled = False
 
     self.reset()
 
@@ -38,25 +36,16 @@ class LatControlLQR(LatControl):
     super().reset()
     self.i_lqr = 0.0
 
-  def live_tune(self):
-    self.mpc_frame += 1
-    if self.mpc_frame % 300 == 0:
-      self.scale_ = float(Decimal(self.params.get("Scale", encoding="utf8")) * Decimal('1.0'))
-      self.ki_ = float(Decimal(self.params.get("LqrKi", encoding="utf8")) * Decimal('0.001'))
-      self.dc_gain_ = float(Decimal(self.params.get("DcGain", encoding="utf8")) * Decimal('0.00001'))
-      self.scale = self.scale_
-      self.ki = self.ki_
-      self.dc_gain = self.dc_gain_
+  def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
+    pass
 
-      self.mpc_frame = 0
+  def reset():
+    pass
 
-  def update(self, active, CS, VM, params, steer_limited, desired_curvature, desired_curvature_rate, calibrated_pose):
+  def update(self, active, CS, VM, params, steer_limited_by_controls, desired_curvature, calibrated_pose, curvature_limited):
     self.ll_timer += 1
     if self.ll_timer > 100:
       self.ll_timer = 0
-      self.live_tune_enabled = self.params.get_bool("KisaLiveTunePanelEnable")
-    if self.live_tune_enabled:
-      self.live_tune()
 
     lqr_log = log.ControlsState.LateralLQRState.new_message()
 
