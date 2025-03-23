@@ -32,6 +32,12 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "../assets/img_experimental_white.svg",
     },
     {
+      "UseLQR",
+      tr("Use of LQR on Rails controller"),
+      tr("Uses a custom developed LQR controller insted of the default PID."),
+      "../assets/offroad/icon_checkmark.svg",
+    },
+    {
       "DisengageOnAccelerator",
       tr("Disengage on Accelerator Pedal"),
       tr("When enabled, pressing the accelerator pedal will disengage openpilot."),
@@ -59,12 +65,6 @@ TogglesPanel::TogglesPanel(SettingsWindow *parent) : ListWidget(parent) {
       "IsMetric",
       tr("Use Metric System"),
       tr("Display speed in km/h instead of mph."),
-      "../assets/offroad/icon_metric.png",
-    },
-    {
-      "UseLQR",
-      tr("Use of LQR on Rails controller"),
-      tr("Uses a custom developed LQR controller insted of the default PID."),
       "../assets/offroad/icon_metric.png",
     },
 
