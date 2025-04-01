@@ -36,8 +36,6 @@ class LatControlLQR(LatControl):
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     pass
 
-  def reset():
-    pass
 
   def update(self, active, CS, VM, params, steer_limited_by_controls, desired_curvature, calibrated_pose, curvature_limited):
     self.ll_timer += 1
