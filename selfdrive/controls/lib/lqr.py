@@ -1,18 +1,15 @@
 import math
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL
 from cereal import log
+from opendbc.car.interfaces import LatControlInputs
+from opendbc.car.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
-
-from openpilot.common.params import Params
-from decimal import Decimal
 
 class LatControlLQR(LatControl):
   def __init__(self, CP, CI):
     super().__init__(CP, CI)
     self.mpc_frame = 0
-    self.params = Params()
 
     self.scale = 1700.0
     self.ki = 0.01
@@ -25,8 +22,8 @@ class LatControlLQR(LatControl):
     self.dc_gain = 0.0027
 
     self.x_hat = np.array([[0], [0]])
-    self.i_unwind_rate = 0.3 * DT_CTRL
-    self.i_rate = 1.0 * DT_CTRL
+    self.i_unwind_rate = 0.3
+    self.i_rate = 1.0
 
     self.reset()
 
@@ -47,7 +44,7 @@ class LatControlLQR(LatControl):
     if self.ll_timer > 100:
       self.ll_timer = 0
 
-    lqr_log = log.ControlsState.LateralLQRState.new_message()
+    lqr_log = log.ControlsState.LateralTorqueState.new_message()
 
     torque_scale = (0.45 + CS.vEgo / 60.0)**2  # Scale actuator model with speed
 
@@ -96,5 +93,5 @@ class LatControlLQR(LatControl):
     lqr_log.i = float(self.i_lqr)
     lqr_log.output = float(output_steer)
     lqr_log.lqrOutput = float(lqr_output)
-    lqr_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_steer) < 1e-3, CS, steer_limited))
+    lqr_log.saturated = self._check_saturation(self.steer_max - abs(output_steer) < 1e-3, CS)
     return output_steer, desired_angle, lqr_log
