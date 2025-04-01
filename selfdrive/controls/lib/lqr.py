@@ -87,7 +87,6 @@ class LatControlLQR(LatControl):
       output_steer = lqr_output + self.i_lqr
       output_steer = np.clip(output_steer, -self.steer_max, self.steer_max)
 
-    lqr_log.steeringAngleDeg = float(angle_steers_k)
     lqr_log.i = float(self.i_lqr)
     lqr_log.output = float(output_steer)
     lqr_log.lqrOutput = float(lqr_output)
