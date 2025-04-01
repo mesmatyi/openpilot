@@ -53,7 +53,6 @@ class LatControlLQR(LatControl):
 
     instant_offset = params.angleOffsetDeg - params.angleOffsetAverageDeg
     desired_angle += instant_offset  # Only add offset that originates from vehicle model errors
-    lqr_log.steeringAngleDesiredDeg = desired_angle
 
     # Update Kalman filter
     angle_steers_k = float(self.C.dot(self.x_hat))
