@@ -70,7 +70,6 @@ class LatControlLQR(LatControl):
       u_lqr = float(desired_angle / self.dc_gain - self.K.dot(self.x_hat))
       lqr_output = torque_scale * u_lqr / self.scale
 
-      print(lqr_output)
 
       # Integrator
       if CS.steeringPressed:
@@ -86,5 +85,6 @@ class LatControlLQR(LatControl):
 
       output_steer = lqr_output + self.i_lqr
       output_steer = np.clip(output_steer, -self.steer_max, self.steer_max)
+      print(output_steer)
 
     return output_steer, desired_angle, lqr_log
