@@ -32,6 +32,26 @@ class LatControlTorque(LatControl):
     self.use_steering_angle = self.torque_params.useSteeringAngle
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
 
+    self.mpc_frame = 0
+
+    self.scale = 1700.0
+    self.ki = 0.01
+
+    self.A = np.array([0.,1.,-0.2261, 1.2182]).reshape((2, 2))
+    self.B = np.array([-1.92,3.95]).reshape((2, 1))
+    self.C = np.array([1.,0.]).reshape((1, 2))
+    self.K = np.array([-110.73,451.22]).reshape((1, 2))
+    self.L = np.array([0.32,0.31]).reshape((2, 1))
+    self.dc_gain = 0.0027
+
+    self.x_hat = np.array([[0], [0]])
+    self.i_unwind_rate = 0.3
+    self.i_rate = 1.0
+
+    self.reset()
+
+    self.ll_timer = 0
+
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
@@ -43,6 +63,46 @@ class LatControlTorque(LatControl):
       output_torque = 0.0
       pid_log.active = False
     else:
+
+      #### LQR start
+
+      lqr_log = log.ControlsState.LateralTorqueState.new_message()
+
+      torque_scale = (0.45 + CS.vEgo / 60.0)**2  # Scale actuator model with speed
+
+      # Subtract offset. Zero angle should correspond to zero torque
+      steering_angle_no_offset = CS.steeringAngleDeg - params.angleOffsetAverageDeg
+
+      desired_angle = math.degrees(VM.get_steer_from_curvature(-desired_curvature, CS.vEgo, params.roll))
+
+      instant_offset = params.angleOffsetDeg - params.angleOffsetAverageDeg
+      desired_angle += instant_offset  # Only add offset that originates from vehicle model errors
+
+      # Update Kalman filter
+      angle_steers_k = float(self.C.dot(self.x_hat))
+      e = steering_angle_no_offset - angle_steers_k
+      self.x_hat = self.A.dot(self.x_hat) + self.B.dot(CS.steeringTorqueEps / torque_scale) + self.L.dot(e)
+
+      # LQR
+      u_lqr = float(desired_angle / self.dc_gain - self.K.dot(self.x_hat))
+      lqr_output = torque_scale * u_lqr / self.scale
+
+
+      error = desired_angle - angle_steers_k
+      i = self.i_lqr + self.ki * self.i_rate * error
+      control = lqr_output + i
+
+      if (error >= 0 and (control <= self.steer_max or i < 0.0)) or \
+          (error <= 0 and (control >= -self.steer_max or i > 0.0)):
+        self.i_lqr = i
+
+      output_steer = (lqr_output + self.i_lqr)
+      output_steer = np.clip(output_steer, -self.steer_max, self.steer_max)
+
+
+      #### LQR end #####
+
+
       actual_curvature_vm = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
       if self.use_steering_angle:
@@ -79,6 +139,9 @@ class LatControlTorque(LatControl):
                                       speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator)
 
+
+
+
       pid_log.active = True
       pid_log.p = float(self.pid.p)
       pid_log.i = float(self.pid.i)
@@ -89,6 +152,8 @@ class LatControlTorque(LatControl):
       pid_log.desiredLateralAccel = float(desired_lateral_accel)
       pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_controls, curvature_limited))
       print(-output_torque)
+
+      output_torque = output_steer
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
