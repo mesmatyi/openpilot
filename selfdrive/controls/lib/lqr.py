@@ -83,7 +83,7 @@ class LatControlLQR(LatControl):
            (error <= 0 and (control >= -self.steer_max or i > 0.0)):
           self.i_lqr = i
 
-      output_steer = (lqr_output + self.i_lqr) / 10000
+      output_steer = (lqr_output + self.i_lqr) / 1000
       output_steer = np.clip(output_steer, -self.steer_max, self.steer_max)
       print(output_steer)
 
