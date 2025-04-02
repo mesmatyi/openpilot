@@ -63,11 +63,14 @@ class LatControlLQR(LatControl):
       lqr_output = 0.
       output_steer = 0.
       self.reset()
+      print("Not Active")
     else:
 
       # LQR
       u_lqr = float(desired_angle / self.dc_gain - self.K.dot(self.x_hat))
       lqr_output = torque_scale * u_lqr / self.scale
+
+      print(lqr_output)
 
       # Integrator
       if CS.steeringPressed:
