@@ -48,6 +48,8 @@ class LatControlTorque(LatControl):
     self.i_unwind_rate = 0.3
     self.i_rate = 1.0
 
+    self.i_lqr = 0.0
+
     self.reset()
 
     self.ll_timer = 0
@@ -89,14 +91,14 @@ class LatControlTorque(LatControl):
 
 
       error = desired_angle - angle_steers_k
-      i = self.i_lqr + self.ki * self.i_rate * error
-      control = lqr_output + i
+      # i = self.i_lqr + self.ki * self.i_rate * error
+      # control = lqr_output + i
 
-      if (error >= 0 and (control <= self.steer_max or i < 0.0)) or \
-          (error <= 0 and (control >= -self.steer_max or i > 0.0)):
-        self.i_lqr = i
+      # if (error >= 0 and (control <= self.steer_max or i < 0.0)) or \
+      #     (error <= 0 and (control >= -self.steer_max or i > 0.0)):
+      #   self.i_lqr = i
 
-      output_steer = (lqr_output + self.i_lqr)
+      output_steer = lqr_output
       output_steer = np.clip(output_steer, -self.steer_max, self.steer_max)
 
 
