@@ -98,16 +98,13 @@ class LatControlTorque(LatControl):
       # **State Vector: [steering angle error, target lateral acceleration]**
       x = np.array([[pid_log.error], [0]])
 
-      # **Adaptive Gain Scaling Based on Speed**
-      # Higher speeds → More conservative control (lower Q, higher R)
-      q_scale = 1 + np.tanh(np.linalg.norm(x) / (2 + CS.vEgo / 10))
-      r_scale = 1 + 0.5 * (CS.vEgo / 30)  # More damping at high speeds
+      # # **Adaptive Gain Scaling Based on Speed**
+      # # Higher speeds → More conservative control (lower Q, higher R)
+      # q_scale = 1 + np.tanh(np.linalg.norm(x) / (2 + CS.vEgo / 10))
+      # r_scale = 1 + 0.5 * (CS.vEgo / 30)  # More damping at high speeds
 
-      Q = self.Q_base * q_scale
-      R = self.R_base * r_scale
-
-      # Compute adaptive LQR gain
-      K = self.compute_lqr_gain(Q, R)
+      # Q = self.Q_base * q_scale
+      # R = self.R_base * r_scale
 
       # Compute control action: u = -Kx
       torque = float(-K @ x)
