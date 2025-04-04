@@ -34,8 +34,6 @@ class LatControlTorque(LatControl):
 
     self.mpc_frame = 0
 
-    self.lqr = AdaptiveLQR()
-
     self.reset()
 
     self.ll_timer = 0
