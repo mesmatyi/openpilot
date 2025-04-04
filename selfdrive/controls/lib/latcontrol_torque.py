@@ -22,56 +22,6 @@ from openpilot.common.pid import PIDController
 LOW_SPEED_X = [0, 10, 20, 30]
 LOW_SPEED_Y = [15, 13, 10, 5]
 
-class AdaptiveLQR:
-    def __init__(self):
-        """
-        Initializes the Adaptive LQR Controller.
-        :param A: System dynamics matrix.
-        :param B: Control input matrix.
-        :param Q_base: Base state cost matrix.
-        :param R_base: Base control cost matrix.
-        """
-        self.A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
-        self.B = np.array([[0.6], [0.2]])          # Control input matrix
-        self.Q_base = np.array([[5.0, 0], [0, 1.0]])
-        self.R_base = np.array([[0.5]])
-
-    def compute_lqr_gain(self, Q, R):
-        """ Solves the Discrete Algebraic Riccati Equation for LQR gain K. """
-        P = scipy.linalg.solve_discrete_are(self.A, self.B, Q, R)
-        K = np.linalg.inv(self.B.T @ P @ self.B + R) @ (self.B.T @ P @ self.A)
-        return K
-
-    def adaptive_control(self, steering_error, a_y_target, velocity):
-        """
-        Computes the adaptive LQR control input (torque).
-        :param steering_error: Steering angle error (rad).
-        :param a_y_target: Target lateral acceleration (m/s²).
-        :param velocity: Vehicle speed (m/s).
-        :return: Torque command in range [-1, 1].
-        """
-        # **State Vector: [steering angle error, target lateral acceleration]**
-        x = np.array([[steering_error], [a_y_target]])
-
-        # **Adaptive Gain Scaling Based on Speed**
-        # Higher speeds → More conservative control (lower Q, higher R)
-        q_scale = 1 + np.tanh(np.linalg.norm(x) / (2 + velocity / 10))
-        r_scale = 1 + 0.5 * (velocity / 30)  # More damping at high speeds
-
-        Q = self.Q_base * q_scale
-        R = self.R_base * r_scale
-
-        # Compute adaptive LQR gain
-        K = self.compute_lqr_gain(Q, R)
-
-        # Compute control action: u = -Kx
-        torque = float(-K @ x)
-
-        # **Limit torque to the range [-1, 1]**
-        torque = np.clip(torque, -1, 1)
-        return torque
-
-
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI):
     super().__init__(CP, CI)
@@ -137,8 +87,6 @@ class LatControlTorque(LatControl):
                                       feedforward=ff,
                                       speed=CS.vEgo,
                                       freeze_integrator=freeze_integrator)
-
-      lqr_torque = self.lqr(pid_log.error,0.0,CS.vEgo)
 
 
       A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
