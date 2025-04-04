@@ -140,6 +140,8 @@ class LatControlTorque(LatControl):
 
       lqr_torque = self.lqr(pid_log.error,0.0,CS.vEgo)
 
+      output_torque = lqr_torque
+
 
 
 
@@ -156,5 +158,4 @@ class LatControlTorque(LatControl):
 
     # TODO left is positive in this convention
 
-    output_torque = lqr_torque
     return -output_torque, 0.0, pid_log
