@@ -140,7 +140,36 @@ class LatControlTorque(LatControl):
 
       lqr_torque = self.lqr(pid_log.error,0.0,CS.vEgo)
 
-      output_torque = lqr_torque
+
+      A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
+      B = np.array([[0.6], [0.2]])          # Control input matrix
+      Q = np.array([[5.0, 0], [0, 1.0]])
+      R = np.array([[0.5]])
+
+      P = scipy.linalg.solve_discrete_are(A, B, Q, R)
+      K = np.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)
+
+      # **State Vector: [steering angle error, target lateral acceleration]**
+      x = np.array([[pid_log.error], [0]])
+
+      # **Adaptive Gain Scaling Based on Speed**
+      # Higher speeds → More conservative control (lower Q, higher R)
+      q_scale = 1 + np.tanh(np.linalg.norm(x) / (2 + CS.vEgo / 10))
+      r_scale = 1 + 0.5 * (CS.vEgo / 30)  # More damping at high speeds
+
+      Q = self.Q_base * q_scale
+      R = self.R_base * r_scale
+
+      # Compute adaptive LQR gain
+      K = self.compute_lqr_gain(Q, R)
+
+      # Compute control action: u = -Kx
+      torque = float(-K @ x)
+
+      # **Limit torque to the range [-1, 1]**
+      torque = np.clip(torque, -1, 1)
+
+      output_torque = torque
 
 
 
