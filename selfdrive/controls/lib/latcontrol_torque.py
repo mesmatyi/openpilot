@@ -76,27 +76,22 @@ class LatControlTorque(LatControl):
       torque_from_measurement = self.torque_from_lateral_accel(LatControlInputs(measurement, roll_compensation, CS.vEgo, CS.aEgo), self.torque_params,
                                                                measurement, lateral_accel_deadzone, friction_compensation=False, gravity_adjusted=False)
       pid_log.error = float(torque_from_setpoint - torque_from_measurement)
-      ff = self.torque_from_lateral_accel(LatControlInputs(gravity_adjusted_lateral_accel, roll_compensation, CS.vEgo, CS.aEgo), self.torque_params,
-                                          desired_lateral_accel - actual_lateral_accel, lateral_accel_deadzone, friction_compensation=True,
-                                          gravity_adjusted=True)
 
-      freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
-      output_torque = self.pid.update(pid_log.error,
-                                      feedforward=ff,
-                                      speed=CS.vEgo,
-                                      freeze_integrator=freeze_integrator)
+      angle_steers_des_no_offset = math.degrees(VM.get_steer_from_curvature(-desired_curvature, CS.vEgo, params.roll))
+      angle_steers_des = angle_steers_des_no_offset + params.angleOffsetDeg
+      steer_error = angle_steers_des - CS.steeringAngleDeg
 
 
       A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
       B = np.array([[0.6], [0.2]])          # Control input matrix
-      Q = np.array([[5.0, 0], [0, 1.0]])
+      Q = np.array([[5.0, 0], [0, 3.0]])
       R = np.array([[0.5]])
 
       P = scipy.linalg.solve_discrete_are(A, B, Q, R)
       K = np.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)
 
       # **State Vector: [steering angle error, target lateral acceleration]**
-      x = np.array([[pid_log.error], [0]])
+      x = np.array([[pid_log.error], [steer_error]])
 
       # # **Adaptive Gain Scaling Based on Speed**
       # # Higher speeds → More conservative control (lower Q, higher R)
@@ -116,13 +111,12 @@ class LatControlTorque(LatControl):
 
 
 
-
       pid_log.active = True
       pid_log.p = float(self.pid.p)
       pid_log.i = float(self.pid.i)
       pid_log.d = float(self.pid.d)
       pid_log.f = float(self.pid.f)
-      pid_log.output = float(-output_torque)
+      pid_log.output = float(output_torque)
       pid_log.actualLateralAccel = float(actual_lateral_accel)
       pid_log.desiredLateralAccel = float(desired_lateral_accel)
       pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_controls, curvature_limited))
@@ -130,4 +124,4 @@ class LatControlTorque(LatControl):
 
     # TODO left is positive in this convention
 
-    return -output_torque, 0.0, pid_log
+    return output_torque, 0.0, pid_log
