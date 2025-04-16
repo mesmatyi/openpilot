@@ -123,7 +123,7 @@ class LatControlTorque(LatControl):
       # **Limit torque to the range [-1, 1]**
       torque = np.clip(torque, -1, 1)
 
-      output_torque = torque
+      output_torque = output_torque_pid
 
 
 
@@ -140,4 +140,4 @@ class LatControlTorque(LatControl):
 
     # TODO left is positive in this convention
 
-    return -output_torque_pid, 0.0, pid_log
+    return -output_torque, 0.0, pid_log
