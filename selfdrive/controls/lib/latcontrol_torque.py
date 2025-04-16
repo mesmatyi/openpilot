@@ -83,6 +83,16 @@ class LatControlTorque(LatControl):
 
       lateral_acell_error = desired_lateral_accel - actual_lateral_accel
 
+      ff = self.torque_from_lateral_accel(LatControlInputs(gravity_adjusted_lateral_accel, roll_compensation, CS.vEgo, CS.aEgo), self.torque_params,
+                                          desired_lateral_accel - actual_lateral_accel, lateral_accel_deadzone, friction_compensation=True,
+                                          gravity_adjusted=True)
+
+      freeze_integrator = steer_limited_by_controls or CS.steeringPressed or CS.vEgo < 5
+      output_torque_pid = self.pid.update(pid_log.error,
+                                      feedforward=ff,
+                                      speed=CS.vEgo,
+                                      freeze_integrator=freeze_integrator)
+
 
       A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
       B = np.array([[0.6], [0.2]])          # Control input matrix
@@ -122,7 +132,7 @@ class LatControlTorque(LatControl):
       pid_log.i = float(self.pid.i)
       pid_log.d = float(self.pid.d)
       pid_log.f = float(self.pid.f)
-      pid_log.output = float(output_torque)
+      pid_log.output = float(output_torque_pid)
       pid_log.actualLateralAccel = float(actual_lateral_accel)
       pid_log.desiredLateralAccel = float(desired_lateral_accel)
       pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_controls, curvature_limited))
@@ -130,4 +140,4 @@ class LatControlTorque(LatControl):
 
     # TODO left is positive in this convention
 
-    return output_torque, 0.0, pid_log
+    return -output_torque_pid, 0.0, pid_log
