@@ -81,6 +81,8 @@ class LatControlTorque(LatControl):
       angle_steers_des = angle_steers_des_no_offset + params.angleOffsetDeg
       steer_error = angle_steers_des - CS.steeringAngleDeg
 
+      lateral_acell_error = desired_lateral_accel - actual_lateral_accel
+
 
       A = np.array([[1.0, 0.1], [0, 1.0]])  # State transition (simplified)
       B = np.array([[0.6], [0.2]])          # Control input matrix
@@ -101,8 +103,12 @@ class LatControlTorque(LatControl):
       # Q = self.Q_base * q_scale
       # R = self.R_base * r_scale
 
+      L = 2.7
+
+      ff = math.atan2(L * desired_curvature, 1)
+
       # Compute control action: u = -Kx
-      torque = float(-K @ x)
+      torque = float(-K @ x) + ff
 
       # **Limit torque to the range [-1, 1]**
       torque = np.clip(torque, -1, 1)
