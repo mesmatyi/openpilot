@@ -61,6 +61,9 @@ def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
+def ros2_enabled(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return params.get_bool("Ros2Enabled")
+
 def or_(*fns):
   return lambda *args: operator.or_(*(fn(*args) for fn in fns))
 
@@ -74,6 +77,7 @@ procs = [
   NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
   NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(livestream, notcar)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
+  PythonProcess("ros2_bridge", "openpilot.system.ros2.ros2_bridge", ros2_enabled),
 
   NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, livestream), enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.system.camerad.webcam.camerad", driverview, enabled=WEBCAM),

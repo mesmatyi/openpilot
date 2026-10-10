@@ -90,10 +90,19 @@ class DeveloperLayout(Widget):
     )
     self._on_enable_ui_debug(self._params.get_bool("ShowDebugInfo"))
 
+    self._ros2_toggle = toggle_item(
+      lambda: tr("ROS 2 Telemetry"),
+      description=lambda: tr("Publish selected openpilot vehicle, plan, lane model, and sensor messages to ROS 2 topics on the network. " +
+                             "This includes location data. Camera images are not streamed. ROS 2 must be installed and configured on this device."),
+      initial_state=self._params.get_bool("Ros2Enabled"),
+      callback=self._on_enable_ros2,
+    )
+
     self._scroller = Scroller([
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys,
+      self._ros2_toggle,
       self._joystick_toggle,
       self._long_maneuver_toggle,
       self._lat_maneuver_toggle,
@@ -147,6 +156,7 @@ class DeveloperLayout(Widget):
       ("LateralManeuverMode", self._lat_maneuver_toggle),
       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
       ("ShowDebugInfo", self._ui_debug_toggle),
+      ("Ros2Enabled", self._ros2_toggle),
     ):
       item.action_item.set_state(self._params.get_bool(key))
 
@@ -154,6 +164,9 @@ class DeveloperLayout(Widget):
     self._params.put_bool("ShowDebugInfo", state, block=True)
     gui_app.set_show_touches(state)
     gui_app.set_show_fps(state)
+
+  def _on_enable_ros2(self, state: bool):
+    self._params.put_bool("Ros2Enabled", state, block=True)
 
   def _on_enable_adb(self, state: bool):
     self._params.put_bool("AdbEnabled", state, block=True)
