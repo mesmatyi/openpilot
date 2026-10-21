@@ -4,6 +4,140 @@ Our software is open source so you can solve your own problems without needing h
 
 Development is coordinated through [Discord](https://discord.comma.ai) and GitHub.
 
+## Experimental Bench Camera Mode (comma four)
+
+This fork has an opt-in **Bench Camera Mode** in Developer settings. It uses the
+device's built-in cameras, not `USE_WEBCAM` or a USB webcam. This is **not a real
+drive**, a calibration procedure, a vehicle simulator, or a supported way to
+control a vehicle. Hardware operation and cloud acceptance require separate
+validation; mocked tests are not hardware validation.
+
+### Start, stop, and recovery
+
+* Physically disconnect the device from **all vehicle/harness connections**.
+  Use an appropriate standalone power supply, a stable mount, clear ventilation,
+  and active cooling. Camera/model operation can draw substantial power and heat.
+* With normal openpilot running **offroad**, open Settings → Developer →
+  **Bench Camera Mode**, read the recording/location disclosure, and confirm.
+  No separate launcher, systemd override, firmware change, or OS upgrade is needed.
+* Normal registration, training/terms, storage, boot, thermal, and other startup
+  gates still apply. A request does not force them to pass. A rejected request or
+  a pending startup reason is shown in the Developer item.
+* The persistent red **BENCH MODE — NO VEHICLE CONTROL | STOP** banner appears
+  above all pages, including onroad and settings. Tap it to stop. Starting is
+  offroad-only; stopping does not require returning to offroad settings.
+* Stop and wait for offroad before doing anything else. On connection, stale
+  hardware, adapter failure, or thermal permission loss, the session stops and
+  cannot auto-restart. The no-output lock remains until session publishers are
+  stopped, the real device state is offroad, and fresh raw panda health is safe.
+  If blocked, keep the device disconnected, cool it, and restart normal openpilot
+  (or reboot while disconnected). No session auto-enables on manager start/boot.
+* Do not connect a vehicle during a session to test the interlock. Hardware safety
+  verification must use a controlled fixture, not a car capable of actuation.
+
+### Safety architecture and limits
+
+The existing manager supervises `benchd`; it replaces only `card`'s `carState` and
+`carParams` publishers. The real `pandad` remains the only owner of `pandaStates`,
+CAN reception and fan/IR peripherals. `hardwared` remains the only owner of
+`deviceState`, including all real health, thermal and network measurements.
+Only its ignition condition can be supplied by a fresh manager lease **and**
+adapter heartbeat. Missing/stale either one denies bench ignition.
+
+Admission requires one fresh, valid, known panda in `noOutput`, no controls
+allowed, **raw** ignition line and CAN ignition off, harness `notConnected`, and
+zero receive counters on all three CAN buses. Existing `STARTED`, `FAKESEND`,
+`USE_WEBCAM`, replay, and simulation environments are refused, even if empty.
+CAN receive counters are cumulative: previous CAN traffic can conservatively
+block entry/exit until a disconnected panda/device restart. Multiple or unknown
+pandas are refused. This detects exposed hardware signals, **not an absolute
+proof of physical disconnection**: a quiet/unpowered vehicle, unusual adapter,
+or faulty harness sensor may be undetectable. Physical disconnection remains
+mandatory. Trusted software and working, normally validated panda firmware are
+assumed; this is not an interlock against malicious local code.
+
+`pandad` explicitly drops `sendcan` while locked, forces `noOutput` instead of
+fingerprinting/ELM327 or vehicle safety configuration, and never sends an engaged
+heartbeat. `selfdrived` stays disabled with a latched bench engagement interlock.
+Controllers, joystick/maneuver tools, planners, radar, and vehicle parameter,
+torque and delay learners are excluded even if their debug toggles were enabled.
+The manager joins session publishers before handoff/cleanup; an unsafe exit
+cannot fall through to real-ignition control. No persistent `STARTED`/`FAKESEND`
+variables are set and no firmware safety logic is changed.
+
+Synthetic CP is passive, `notCar`, `noOutput`, with an explicit
+`BENCH CAMERA MODE - NOT A VEHICLE` fingerprint and no invented vehicle geometry.
+Only transient `CarParams` is written. Saved driving calibration, CarParams
+caches, torque/delay/vehicle parameters, location initial state, and DM handedness
+are not overwritten by bench learning. Bench calibration starts from default
+transforms, remains uncalibrated at stationary speed, and is not saved; unlike
+the usual `notCar` shortcut it does **not** claim calibrated status. Location
+estimation starts without the saved driving initial state. Normal car mode must
+obtain fresh transient CP/firmware/control readiness after cleanup.
+
+### Real versus synthetic data and model diagnostics
+
+Expected **real** services (when supported by the hardware/configuration):
+
+* `narrowRoadCameraState`, `wideRoadCameraState`, `cabinCameraState`
+* `modelV2`, `cameraOdometry`, `driverStateV2`, `driverMonitoringState`
+* `accelerometer`, `gyroscope`, `deviceMotion` (this checkout's location output)
+* `gpsLocation` / `gpsLocationExternal`: monitor both, but only the selected
+  backend is expected. An indoor GPS fix is not guaranteed. This mode never
+  invents a fix, position, speed, or GPS message.
+* `selfdriveState` is from real `selfdrived` but must remain disabled/inactive.
+  `carState` is explicitly synthetic stationary data with cruise off and
+  `canValid=false`; it is not successful CAN validation.
+
+Use `managerState` to check that the allowed daemons are actually running.
+Use `messaging.SubMaster` to observe the above streams, checking **seen, alive,
+valid, frequency and timestamps separately**. Do not start another publisher
+(including `uiview.py`) to fill missing outputs.
+
+For missing `modelV2`/`cameraOdometry`, inspect modeld's process state and
+`/data/log` logs: distinguish model asset/loading/backend errors (including
+Chestnut status on configurations that use it), waiting for transient CarParams,
+VisionIPC connection/frame synchronization, and missing extrinsics calibration.
+`calibrationd` depends on camera odometry and publishes initial uncalibrated
+transforms while starting; bench does not bypass model loading errors or mark
+health/model outputs successful. Default transforms allow experimental inference
+but are not a valid driving calibration. Missing `deviceMotion` additionally
+requires checking camera odometry and both real IMU streams. Missing
+`selfdriveState` requires checking adapter CP/carState and selfdrived startup.
+Validity/frequency warnings caused by absent vehicle/control services are not
+evidence that they should be faked.
+
+### Recording, uploads, and verification matrix
+
+Normal logger/encoder, deletion, registration, uploader and Athena/connect
+communication lifecycles remain available. `DisableLogging` is respected even
+with a stale real-car CP and is preserved across synthetic transitions.
+Driver-camera recording/lock, metering and other privacy choices are unchanged;
+real cabin inference is not a promise that cabin video will be recorded.
+Logger initData captures `BenchMode`/status and transient synthetic CP where
+normal metadata is supported. No route metadata, engagement or GPS is falsified
+to force cloud visibility. Local qlog/rlog/video files, an upload flag, or a
+summary's `user.upload=1` do **not** prove backend acceptance. Full rlogs and
+high-resolution video can require explicit requests; cloud listing and full
+automatic uploads are not promised.
+
+Mocked regression coverage is in
+`openpilot/system/manager/test/test_bench.py`; run
+`python3 -m unittest openpilot.system.manager.test.test_bench`.
+It covers startup/reset defaults, confirmation, raw signal rejection, leases,
+adapter failure/staleness, stop/normal recovery, process selection/publisher
+ownership, and privacy/cache preservation without requiring hardware.
+
+Before relying on this experimental mode, separately test on a disconnected
+comma four: confirmation readability and banner/Stop on every page; actual
+camera/model/IMU/GPS/location streams; model loading failures; inadequate
+calibration; fan/IR/thermal shutdown; registration/storage/startup blockers;
+adapter and manager crashes; stale/disconnected panda; fixture-only harness/CAN
+detection; repeated start/stop and subsequent normal-car initialization; and
+recording disabled/enabled, cabin privacy, metered uploads and explicit requests.
+Native panda build, GUI interaction, real inference, power/thermal behavior and
+backend upload acceptance cannot be established by the mocked tests alone.
+
 ### Getting Started
 
 * Set up your [development environment](/tools/)

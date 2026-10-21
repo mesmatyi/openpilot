@@ -2,11 +2,21 @@ from collections.abc import Callable
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigToggle, BigParamControl, BigCircleParamControl, GreyBigButton
-from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog, BigInputDialog, BigConfirmationCircleButton
+from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog, BigInputDialog, BigConfirmationCircleButton, SettingDescriptionDialog
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.ssh_key import SshKeyFetcher
+from openpilot.system.manager.bench import BENCH_WARNING, request_start
+
+
+class BenchConfirmPage(SettingDescriptionDialog):
+  def __init__(self):
+    super().__init__("Bench Camera Mode", "\n".join(BENCH_WARNING))
+    accept = BigConfirmationCircleButton("start bench\ncamera mode",
+                                         gui_app.texture("icons_mici/setup/driver_monitoring/dm_check.png", 64, 64),
+                                         lambda: self.dismiss(lambda: request_start(ui_state.params, ui_state.is_offroad(), True)))
+    self._scroller.add_widgets([accept])
 
 
 class AlphaLongConfirmPage(NavScroller):
@@ -31,6 +41,10 @@ class DeveloperLayoutMici(NavScroller):
   def __init__(self):
     super().__init__()
     self._ssh_fetcher = SshKeyFetcher(ui_state.params)
+    self._bench_button = BigButton("Bench Camera Mode", "experimental — start",
+                                   description="Built-in cameras/sensors without a vehicle. Stop using the persistent BENCH banner.")
+    self._bench_button.set_click_callback(lambda: gui_app.push_widget(BenchConfirmPage()))
+    self._bench_button.set_enabled(ui_state.is_offroad)
 
     def github_username_callback(username: str):
       if username:
@@ -88,6 +102,7 @@ class DeveloperLayoutMici(NavScroller):
                                               description="Show touch locations and the UI frame rate.")
 
     self._scroller.add_widgets([
+      self._bench_button,
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys_btn,
@@ -134,6 +149,7 @@ class DeveloperLayoutMici(NavScroller):
   def _update_state(self):
     super()._update_state()
     self._ssh_fetcher.update()
+    self._bench_button.set_value(ui_state.params.get("BenchModeStatus") or "experimental — start")
 
   def show_event(self):
     super().show_event()

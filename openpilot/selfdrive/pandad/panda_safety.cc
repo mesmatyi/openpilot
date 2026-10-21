@@ -3,6 +3,12 @@
 #include "common/swaglog.h"
 
 void PandaSafety::configureSafetyMode(bool is_onroad) {
+  if (params_.getBool("BenchMode")) {
+    panda_->set_safety_model(cereal::CarParams::SafetyModel::NO_OUTPUT);
+    initialized_ = false;
+    safety_configured_ = false;
+    return;
+  }
   if (is_onroad && !safety_configured_) {
     updateMultiplexingMode();
 
