@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from openpilot.system.manager.bench import (
   ADAPTER_TIMEOUT, BENCH_ALWAYS, BENCH_KEYS, BENCH_ONROAD, LEASE_TIMEOUT,
-  BenchController, bench_ignition, fresh, hardware_safe, process_allowed, request_start,
+  UNSAFE_ENV, BenchController, bench_ignition, fresh, hardware_safe, process_allowed, request_start,
 )
 
 
@@ -15,7 +15,7 @@ class MockParams:
   def __init__(self):
     self.values = {}
 
-  def get(self, key):
+  def get(self, key, **kwargs):
     return self.values.get(key)
 
   def get_bool(self, key):
@@ -95,7 +95,7 @@ class TestBench(unittest.TestCase):
         self.assertFalse(self.params.get_bool("BenchModeRequested"))
 
   def test_legacy_simulation_environments_refused(self):
-    for key in ("STARTED", "FAKESEND", "USE_WEBCAM", "REPLAY", "SIMULATION"):
+    for key in UNSAFE_ENV:
       with self.subTest(key=key), patch.dict(os.environ, {key: ""}):
         self.params.put_bool("BenchModeRequested", True)
         self.assertFalse(self.controller.update(self.sm, False, now=100.0))
@@ -369,7 +369,7 @@ class TestBenchUI(unittest.TestCase):
     params = MockParams()
     ui = SimpleNamespace(params=params, is_offroad=Mock(return_value=True))
     button, dialog = Mock(), Mock()
-    gui = SimpleNamespace(big_ui=lambda: False, width=960, push_widget=Mock())
+    gui = SimpleNamespace(big_ui=lambda: False, width=536, push_widget=Mock(), add_nav_stack_tick=Mock(), mouse_events=[])
     modules = {
       "pyray": SimpleNamespace(Rectangle=lambda *a: a),
       "openpilot.common.params": SimpleNamespace(Params=lambda: params),
@@ -399,6 +399,106 @@ class TestBenchUI(unittest.TestCase):
       stop()
       self.assertFalse(params.get_bool("BenchModeRequested"))
       self.assertTrue(params.get_bool("BenchMode"))  # manager, not UI, releases the safety lock
+
+  def test_banner_gestures_do_not_reach_covered_widgets(self):
+    params = MockParams()
+    params.put_bool("BenchMode", True)
+    params.put_bool("BenchModeRequested", True)
+    gui = SimpleNamespace(big_ui=lambda: False, width=536, mouse_events=[], show_touches=False, add_nav_stack_tick=Mock())
+    def rectangle(x, y, width, height):
+      return SimpleNamespace(x=x, y=y, width=width, height=height)
+
+    ray = SimpleNamespace(Rectangle=rectangle, get_time=lambda: 100.0,
+                          check_collision_point_rec=lambda pos, rect: rect.x <= pos.x < rect.x + rect.width and rect.y <= pos.y < rect.y + rect.height)
+    modules = {
+      "pyray": ray,
+      "openpilot.common.params": SimpleNamespace(Params=lambda: params),
+      "openpilot.selfdrive.ui.ui_state": SimpleNamespace(device=SimpleNamespace(awake=True)),
+      "openpilot.system.ui.lib.application": SimpleNamespace(
+        gui_app=gui, MousePos=object, MouseEvent=object, MAX_TOUCH_SLOTS=2),
+    }
+    with patch.dict("sys.modules", modules):
+      base = runpy.run_path(str(Path(__file__).parents[3] / "system/ui/widgets/__init__.py"))
+
+      class ClickWidget(base["Widget"]):
+        def _render(self, rect):
+          pass
+
+      def button(text, click_callback, **kwargs):
+        widget = ClickWidget()
+        widget.set_click_callback(click_callback)
+        return widget
+
+      with patch.dict("sys.modules", {
+        "openpilot.system.ui.widgets": SimpleNamespace(DialogResult=base["DialogResult"]),
+        "openpilot.system.ui.widgets.button": SimpleNamespace(Button=button, ButtonStyle=SimpleNamespace(DANGER=1)),
+        "openpilot.system.ui.widgets.confirm_dialog": SimpleNamespace(ConfirmDialog=Mock()),
+        "openpilot.selfdrive.ui.ui_state": SimpleNamespace(ui_state=Mock()),
+      }):
+        overlay = runpy.run_path(str(Path(__file__).parents[3] / "selfdrive/ui/widgets/bench.py"))["BenchOverlay"]()
+        covered = ClickWidget()
+        changed_privacy = Mock()
+        covered.set_click_callback(changed_privacy)
+        for y, pressed, released in ((20, True, False), (180, False, False), (20, False, False), (20, False, True)):
+          gui.mouse_events[:] = [SimpleNamespace(
+            pos=SimpleNamespace(x=200, y=y), slot=0, left_pressed=pressed, left_released=released, t=100.0)]
+          overlay.capture_input()
+          self.assertEqual(gui.mouse_events, [])
+          covered.render(rectangle(0, 0, 536, 240))
+          overlay.render()
+        changed_privacy.assert_not_called()
+        self.assertFalse(params.get_bool("BenchModeRequested"))
+        self.assertTrue(params.get_bool("BenchMode"))
+        # Non-banner gestures must remain usable.
+        for pressed, released in ((True, False), (False, True)):
+          gui.mouse_events[:] = [SimpleNamespace(
+            pos=SimpleNamespace(x=200, y=180), slot=0, left_pressed=pressed, left_released=released, t=100.0)]
+          overlay.capture_input()
+          covered.render(rectangle(0, 0, 536, 240))
+          overlay.render()
+        changed_privacy.assert_called_once()
+
+  def test_capability_refresh_preserves_persistent_driving_preferences(self):
+    params = MockParams()
+    params.put_bool("BenchMode", True)
+    params.put_bool("AlphaLongitudinalEnabled", True)
+    params.put_bool("ExperimentalMode", True)
+    ui = SimpleNamespace(params=params, CP=SimpleNamespace(alphaLongitudinalAvailable=False),
+                         update_params=Mock(), has_longitudinal_control=False, is_offroad=lambda: True,
+                         is_release=False, engaged=False)
+    modules = {name: MagicMock() for name in (
+      "openpilot.cereal", "openpilot.common.time_helpers", "openpilot.selfdrive.ui.widgets.ssh_key",
+      "openpilot.system.ui.widgets.list_view", "openpilot.system.ui.widgets.confirm_dialog",
+      "openpilot.selfdrive.ui.widgets.bench", "openpilot.system.ui.lib.application",
+      "openpilot.selfdrive.ui.mici.widgets.button", "openpilot.selfdrive.ui.layouts.settings.common",
+    )}
+    modules.update({
+      "openpilot.common.params": SimpleNamespace(Params=lambda: params, UnknownKeyName=KeyError),
+      "openpilot.system.ui.widgets": SimpleNamespace(Widget=object, DialogResult=Mock()),
+      "openpilot.system.ui.widgets.scroller": SimpleNamespace(NavScroller=object),
+      "openpilot.system.ui.widgets.scroller_tici": SimpleNamespace(Scroller=object),
+      "openpilot.system.ui.lib.multilang": SimpleNamespace(tr=lambda s: s, tr_noop=lambda s: s),
+      "openpilot.selfdrive.ui.ui_state": SimpleNamespace(ui_state=ui),
+      "openpilot.selfdrive.ui.mici.widgets.dialog": SimpleNamespace(
+        BigDialog=Mock(), BigInputDialog=Mock(), BigConfirmationCircleButton=Mock(), SettingDescriptionDialog=object),
+    })
+    with patch.dict("sys.modules", modules):
+      for subdir, class_name in (("layouts", "DeveloperLayout"), ("mici/layouts", "DeveloperLayoutMici"),
+                                 ("layouts", "TogglesLayout"), ("mici/layouts", "TogglesLayoutMici")):
+        filename = "developer" if "Developer" in class_name else "toggles"
+        source = runpy.run_path(str(Path(__file__).parents[3] / f"selfdrive/ui/{subdir}/settings/{filename}.py"))
+        layout = object.__new__(source[class_name])
+        layout.__dict__.update({name: Mock() for name in (
+          "_joystick_toggle", "_long_maneuver_toggle", "_lat_maneuver_toggle", "_alpha_long_toggle",
+          "_adb_toggle", "_ssh_toggle", "_ui_debug_toggle", "_experimental_btn", "_personality_toggle",
+          "_long_personality_setting", "_update_experimental_mode_icon",
+        )})
+        layout._params, layout._is_release = params, False
+        layout._refresh_toggles, layout._toggle_defs = (), {}
+        layout._toggles = {"ExperimentalMode": Mock()}
+        layout._update_toggles()
+        self.assertTrue(params.get_bool("AlphaLongitudinalEnabled"), class_name)
+        self.assertTrue(params.get_bool("ExperimentalMode"), class_name)
 
   def test_road_view_and_awake_without_spoofing_raw_ignition(self):
     params = MockParams()
@@ -471,6 +571,23 @@ class TestBenchEngagement(unittest.TestCase):
       sd.bench_mode = False
       sd.step()
       sd.state_machine.update.assert_called_once()  # normal mode is unchanged
+      params = MockParams()
+      for key in ("BenchMode", "AlphaLongitudinalEnabled", "ExperimentalMode"):
+        params.put_bool(key, True)
+      modules["openpilot.common.params"].Params.return_value = params
+      cp = SimpleNamespace(brand="mock", alphaLongitudinalAvailable=False, openpilotLongitudinalControl=False)
+      initialized = source["SelfdriveD"](cp)
+      self.assertTrue(params.get_bool("AlphaLongitudinalEnabled"))
+      self.assertTrue(params.get_bool("ExperimentalMode"))
+      initialized.publish_selfdriveState(Mock())
+      packet = source["messaging"].new_message.return_value.selfdriveState
+      self.assertFalse(packet.enabled)
+      self.assertFalse(packet.active)
+      self.assertFalse(packet.engageable)
+      params.put_bool("BenchMode", False)
+      source["SelfdriveD"](cp)
+      self.assertIsNone(params.get("AlphaLongitudinalEnabled"))
+      self.assertIsNone(params.get("ExperimentalMode"))  # ordinary capability cleanup still applies
 
 
 if __name__ == "__main__":

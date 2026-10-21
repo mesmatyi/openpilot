@@ -18,6 +18,8 @@ BENCH_ONROAD = frozenset({
 })
 TRANSIENT_CAR_KEYS = ("CarParams", "ControlsReady", "FirmwareQueryDone", "ObdMultiplexingEnabled", "ObdMultiplexingChanged")
 BENCH_KEYS = ("BenchModeRequested", "BenchMode", "BenchModeLease", "BenchAdapterHeartbeat", "BenchModeStatus")
+UNSAFE_ENV = ("STARTED", "FAKESEND", "USE_WEBCAM", "REPLAY", "SIMULATION",
+              "NO_FAN_CONTROL", "BOARDD_SKIP_FW_CHECK", "BOARDD_LOOPBACK", "NOBOARD")
 BENCH_WARNING = (
   "Experimental Bench Camera Mode (built-in cameras, not a USB webcam).",
   "Disconnect the device completely from any car and harness before starting. Keep it disconnected throughout the session.",
@@ -91,11 +93,12 @@ class BenchController:
     if not active:
       if not requested:
         return False
-      if (not self.supported or any(k in os.environ for k in ("STARTED", "FAKESEND", "USE_WEBCAM", "REPLAY", "SIMULATION")) or
+      if (not self.supported or any(k in os.environ for k in UNSAFE_ENV) or
           not sm.all_checks(["deviceState"]) or sm["deviceState"].started or
           self.params.get_bool("IsDriverViewEnabled") or not hardware_safe(sm, now)):
         self.params.put_bool("BenchModeRequested", False, block=True)
-        self.params.put("BenchModeStatus", "Refused: requires comma four, offroad, fresh no-output panda and no harness/ignition/CAN.", block=True)
+        self.params.put("BenchModeStatus",
+                        "Refused: requires comma four offroad, no debug overrides, fresh no-output panda and no harness/ignition/CAN.", block=True)
         return False
       clear_car_session(self.params)
       self.params.remove("BenchAdapterHeartbeat")

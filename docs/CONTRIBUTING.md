@@ -23,8 +23,8 @@ validation; mocked tests are not hardware validation.
 * Normal registration, training/terms, storage, boot, thermal, and other startup
   gates still apply. A request does not force them to pass. A rejected request or
   a pending startup reason is shown in the Developer item.
-* The persistent red **BENCH MODE — NO VEHICLE CONTROL | STOP** banner appears
-  above all pages, including onroad and settings. Tap it to stop. Starting is
+* The persistent red **BENCH MODE — NO VEHICLE CONTROL** banner with **TAP TO STOP**
+  appears above all pages, including onroad and settings. Tap it to stop. Starting is
   offroad-only; stopping does not require returning to offroad settings.
 * Stop and wait for offroad before doing anything else. On connection, stale
   hardware, adapter failure, or thermal permission loss, the session stops and
@@ -47,7 +47,8 @@ adapter heartbeat. Missing/stale either one denies bench ignition.
 Admission requires one fresh, valid, known panda in `noOutput`, no controls
 allowed, **raw** ignition line and CAN ignition off, harness `notConnected`, and
 zero receive counters on all three CAN buses. Existing `STARTED`, `FAKESEND`,
-`USE_WEBCAM`, replay, and simulation environments are refused, even if empty.
+`USE_WEBCAM`, replay/simulation, `NO_FAN_CONTROL`, `BOARDD_SKIP_FW_CHECK`,
+`BOARDD_LOOPBACK`, and `NOBOARD` environments are refused, even if empty.
 CAN receive counters are cumulative: previous CAN traffic can conservatively
 block entry/exit until a disconnected panda/device restart. Multiple or unknown
 pandas are refused. This detects exposed hardware signals, **not an absolute
