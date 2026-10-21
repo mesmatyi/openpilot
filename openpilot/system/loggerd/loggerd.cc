@@ -14,6 +14,7 @@
 ExitHandler do_exit;
 
 struct LoggerdState {
+  const bool bench_mode = Params().getBool("BenchMode");
   LoggerState logger;
   std::atomic<double> last_camera_seen_tms{0.0};
   std::atomic<int> ready_to_rotate{0};  // count of encoders ready to rotate
@@ -24,6 +25,19 @@ struct LoggerdState {
 void logger_rotate(LoggerdState *s) {
   bool ret =s->logger.next();
   assert(ret);
+  if (s->bench_mode) {
+    // Persist upload eligibility while the segment is locked, including after stop/reboot.
+    constexpr char bench_attr[] = "user.bench";
+    constexpr char bench_value = '1';
+#ifdef __APPLE__
+    int result = setxattr(s->logger.segmentPath().c_str(), bench_attr, &bench_value, 1, 0, 0);
+#else
+    int result = setxattr(s->logger.segmentPath().c_str(), bench_attr, &bench_value, 1, 0);
+#endif
+    if (result != 0) {
+      LOGE("Failed to mark bench segment for full upload: %s: %s", s->logger.segmentPath().c_str(), strerror(errno));
+    }
+  }
   s->ready_to_rotate = 0;
   s->last_rotate_tms = millis_since_boot();
   LOGW((s->logger.segment() == 0) ? "logging to %s" : "rotated to %s", s->logger.segmentPath().c_str());

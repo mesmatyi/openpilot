@@ -23,8 +23,11 @@ UNSAFE_ENV = ("STARTED", "FAKESEND", "USE_WEBCAM", "REPLAY", "SIMULATION",
 BENCH_WARNING = (
   "Experimental Bench Camera Mode (built-in cameras, not a USB webcam).",
   "Disconnect the device completely from any car and harness before starting. Keep it disconnected throughout the session.",
-  "Uses real cameras, IMU and available GPS. Existing recording and upload settings apply: sensitive video and location may be recorded and uploaded.",
-  "Cannot engage or control a vehicle. Stationary synthetic vehicle inputs are not a real drive. Cloud listing and full automatic uploads are not guaranteed.",
+  "Uses real cameras, IMU and available GPS. All recorded bench logs and camera video are automatically queued for upload on unmetered networks, " +
+  "including after Stop.",
+  "Sensitive video and location may be uploaded. Recording choices still apply; cabin video is recorded only if enabled. " +
+  "Keep the device powered on Wi-Fi to finish uploads.",
+  "Cannot engage or control a vehicle. Stationary synthetic vehicle inputs are not a real drive. Backend acceptance and Connect listing cannot be guaranteed.",
 )
 
 

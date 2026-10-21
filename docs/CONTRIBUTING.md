@@ -117,10 +117,37 @@ Driver-camera recording/lock, metering and other privacy choices are unchanged;
 real cabin inference is not a promise that cabin video will be recorded.
 Logger initData captures `BenchMode`/status and transient synthetic CP where
 normal metadata is supported. No route metadata, engagement or GPS is falsified
-to force cloud visibility. Local qlog/rlog/video files, an upload flag, or a
-summary's `user.upload=1` do **not** prove backend acceptance. Full rlogs and
-high-resolution video can require explicit requests; cloud listing and full
-automatic uploads are not promised.
+to force cloud visibility.
+
+**Recorded bench segments automatically queue all supported recording files for
+upload on unmetered networks**: `qlog[.zst]`, `rlog[.zst]`, `qcamera.ts`,
+`fcamera.hevc`, `ecamera.hevc`, and `dcamera.hevc` when cabin recording is enabled.
+The full rlog contains recorded device/sensor/process/journal messages; ordinary
+boot/crash uploads retain their existing handling. This does not collect arbitrary
+files from the device filesystem or create cameras/logs that were not recorded.
+Normal non-bench routes keep their existing explicit-request behavior for full
+rlogs/high-resolution video.
+
+Loggerd marks each bench segment with the directory xattr `user.bench=1` while
+locked. Eligibility survives Stop, manager restart and reboot; it does not depend
+on the current BenchMode setting. Open/locked segments are never selected.
+Existing boot/crash/qlog/qcamera priority is retained, with full bench recordings
+following. Full bench transfers wait on metered connections; normal lightweight
+upload/metering behavior is unchanged. Keep the device powered, cooled, connected
+to unmetered Wi-Fi and registered until the backlog drains. Storage-pressure
+deletion remains enabled, so files can still be deleted before upload if storage
+runs low. Do not assume offline recordings are retained indefinitely.
+
+For bench recordings, only HTTP 200/201 transfer responses mark nonempty files
+uploaded; authorization failures, HTTP 412 backend refusal and network/server
+errors remain pending and retry with normal backoff. `FAKEUPLOAD` cannot mark
+bench recordings successfully transferred. A marker creation failure is logged
+as `Failed to mark bench segment for full upload`; those files require diagnosis
+and an explicit upload request rather than silently assuming full eligibility.
+Older recordings made before this change are not retroactively tagged.
+Local files, an upload flag, or a summary's `user.upload=1` do **not** prove backend
+acceptance. Connect processing/listing and actual backend retention cannot be
+guaranteed or verified here, even after a successful HTTP transfer.
 
 Mocked regression coverage is in
 `openpilot/system/manager/test/test_bench.py`; run
@@ -128,6 +155,10 @@ Mocked regression coverage is in
 It covers startup/reset defaults, confirmation, raw signal rejection, leases,
 adapter failure/staleness, stop/normal recovery, process selection/publisher
 ownership, and privacy/cache preservation without requiring hardware.
+Bench upload selection, retry/status handling and metering tests are in
+`openpilot/system/loggerd/tests/test_bench_uploader.py`; run
+`python3 -m unittest openpilot.system.loggerd.tests.test_bench_uploader`.
+Loggerd integration tests also check segment tagging.
 
 Before relying on this experimental mode, separately test on a disconnected
 comma four: confirmation readability and banner/Stop on every page; actual

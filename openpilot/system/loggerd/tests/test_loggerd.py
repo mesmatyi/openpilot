@@ -21,6 +21,7 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.system.loggerd.xattr_cache import getxattr
 from openpilot.system.loggerd.deleter import PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE
+from openpilot.system.loggerd.uploader import BENCH_ATTR_NAME, BENCH_ATTR_VALUE
 from openpilot.system.manager.process_config import managed_processes
 from openpilot.common.version import get_version
 from openpilot.tools.lib.helpers import RE
@@ -35,6 +36,20 @@ CEREAL_SERVICES = [f for f in log.Event.schema.union_fields if f in SERVICE_LIST
 
 
 class TestLoggerd(OpenpilotTestCase):
+  @parameterized.expand([(False,), (True,)])
+  def test_bench_upload_segment_marker(self, bench):
+    params = Params()
+    params.put_bool("BenchMode", bench, block=True)
+    try:
+      self._publish_random_messages(["deviceState"])
+      segment = self._get_latest_log_dir()
+      assert getxattr(str(segment), BENCH_ATTR_NAME) == (BENCH_ATTR_VALUE if bench else None)
+      params.put_bool("BenchMode", False, block=True)
+      assert getxattr(str(segment), BENCH_ATTR_NAME) == (BENCH_ATTR_VALUE if bench else None)
+    finally:
+      managed_processes["loggerd"].stop()
+      params.remove("BenchMode")
+
   def _get_latest_log_dir(self):
     log_dirs = sorted(Path(Paths.log_root()).iterdir(), key=lambda f: f.stat().st_mtime)
     return log_dirs[-1]
