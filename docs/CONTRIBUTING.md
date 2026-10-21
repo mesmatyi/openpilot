@@ -131,6 +131,9 @@ rlogs/high-resolution video.
 Loggerd marks each bench segment with the directory xattr `user.bench=1` while
 locked. Eligibility survives Stop, manager restart and reboot; it does not depend
 on the current BenchMode setting. Open/locked segments are never selected.
+Loggerd holds a shared `.loggerd.lock` advisory lock for its writer lifetime;
+uploader restart only clears stale segment locks while it can hold the exclusive
+lock, so it cannot unlock a currently recording segment.
 Existing boot/crash/qlog/qcamera priority is retained, with full bench recordings
 following. Full bench transfers wait on metered connections; normal lightweight
 upload/metering behavior is unchanged. Keep the device powered, cooled, connected
@@ -140,7 +143,8 @@ runs low. Do not assume offline recordings are retained indefinitely.
 
 For bench recordings, only HTTP 200/201 transfer responses mark nonempty files
 uploaded; authorization failures, HTTP 412 backend refusal and network/server
-errors remain pending and retry with normal backoff. `FAKEUPLOAD` cannot mark
+errors remain pending and retry with per-file backoff, allowing other recordings
+to upload while a rejected file waits. `FAKEUPLOAD` cannot mark
 bench recordings successfully transferred. A marker creation failure is logged
 as `Failed to mark bench segment for full upload`; those files require diagnosis
 and an explicit upload request rather than silently assuming full eligibility.

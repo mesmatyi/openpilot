@@ -21,7 +21,7 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.system.loggerd.xattr_cache import getxattr
 from openpilot.system.loggerd.deleter import PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE
-from openpilot.system.loggerd.uploader import BENCH_ATTR_NAME, BENCH_ATTR_VALUE
+from openpilot.system.loggerd.uploader import BENCH_ATTR_NAME, BENCH_ATTR_VALUE, clear_locks
 from openpilot.system.manager.process_config import managed_processes
 from openpilot.common.version import get_version
 from openpilot.tools.lib.helpers import RE
@@ -36,6 +36,20 @@ CEREAL_SERVICES = [f for f in log.Event.schema.union_fields if f in SERVICE_LIST
 
 
 class TestLoggerd(OpenpilotTestCase):
+  def test_uploader_restart_preserves_live_recording_lock(self):
+    pm = messaging.PubMaster(["deviceState"])
+    managed_processes["loggerd"].start()
+    try:
+      assert pm.wait_for_readers_to_update("deviceState", timeout=5)
+      with Timeout(5):
+        while not any(Path(Paths.log_root()).glob("*/rlog.lock")):
+          time.sleep(0.01)
+      locks = list(Path(Paths.log_root()).glob("*/rlog.lock"))
+      clear_locks(Paths.log_root())
+      assert all(lock.exists() for lock in locks)
+    finally:
+      managed_processes["loggerd"].stop()
+
   @parameterized.expand([(False,), (True,)])
   def test_bench_upload_segment_marker(self, bench):
     params = Params()

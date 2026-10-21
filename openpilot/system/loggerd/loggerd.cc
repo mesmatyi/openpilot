@@ -1,4 +1,5 @@
 #include <sys/xattr.h>
+#include <sys/file.h>
 
 #include <map>
 #include <memory>
@@ -233,6 +234,14 @@ void handle_preserve_segment(LoggerdState *s) {
 }
 
 void loggerd_thread() {
+  bool created = util::create_directories(Path::log_root(), 0775);
+  assert(created);
+  // Declared before all writers so stale-lock cleanup cannot run until they are destroyed.
+  std::unique_ptr<FILE, decltype(&fclose)> recording_lock(
+    util::safe_fopen((Path::log_root() + "/.loggerd.lock").c_str(), "a"), fclose);
+  int lock_result = HANDLE_EINTR(flock(fileno(recording_lock.get()), LOCK_SH));
+  assert(lock_result == 0);
+
   // setup messaging
   struct ServiceState {
     std::string name;

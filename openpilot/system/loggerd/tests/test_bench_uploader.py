@@ -1,11 +1,12 @@
 import io
+import fcntl
 import requests
 import runpy
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
 
@@ -135,7 +136,12 @@ class TestBenchUploader(unittest.TestCase):
         self.assertFalse(self.uploader.step(1, False))
         self.assertIsNone(getxattr(str(recording), self.module["UPLOAD_ATTR_NAME"]))
         self.assertEqual(self.uploader.last_filename, "")
-        self.assertEqual(self.uploader.next_file_to_upload(False)[1], key)
+        self.assertIsNone(self.uploader.next_file_to_upload(False))
+        deadline, delay = self.uploader.retry_after[str(recording)]
+        self.assertGreater(delay, 0)
+        with patch("time.monotonic", return_value=deadline + 1):
+          self.assertEqual(self.uploader.next_file_to_upload(False)[1], key)
+        self.uploader.retry_after.clear()
     response = SimpleNamespace(status_code=201, request=SimpleNamespace(headers={"Content-Length": "13"}))
     with patch("requests.put", return_value=response) as put:
       self.assertTrue(self.uploader.step(1, False))
@@ -151,8 +157,10 @@ class TestBenchUploader(unittest.TestCase):
       self.assertFalse(self.uploader.step(1, False))
       put.assert_not_called()
     self.api.get.return_value = SimpleNamespace(status_code=200, text='{"url": "https://upload.invalid/file", "headers": {}}')
-    with patch("requests.put", side_effect=OSError("offline")):
+    self.uploader.retry_after.clear()
+    with patch("requests.put", side_effect=OSError("offline")) as put:
       self.assertFalse(self.uploader.step(1, False))
+      put.assert_called_once()
     self.assertIsNone(getxattr(str(recording), self.module["UPLOAD_ATTR_NAME"]))
 
   def test_fakeupload_cannot_mark_bench_recordings_uploaded(self):
@@ -188,6 +196,62 @@ class TestBenchUploader(unittest.TestCase):
       self.assertFalse(self.uploader.step(1, False))
       put.assert_called_once()
     self.assertIsNone(getxattr(str(recording), self.module["UPLOAD_ATTR_NAME"]))
+
+  def test_rejected_bench_file_does_not_block_other_routes_or_cameras(self):
+    segment = self.make_segment()
+    rejected = self.make_file(segment, "qlog.zst")
+    camera = self.make_file(segment, "fcamera.hevc")
+    normal = self.make_segment("00000002--0123456789--0", bench=False)
+    qlog = self.make_file(normal, "qlog.zst")
+    self.api.get.return_value = SimpleNamespace(status_code=412)
+    self.assertFalse(self.uploader.step(1, False))
+    self.assertEqual(self.uploader.next_file_to_upload(False)[2], str(qlog))
+    self.complete(qlog)
+    self.assertEqual(self.uploader.next_file_to_upload(False)[2], str(camera))
+    deadline, _ = self.uploader.retry_after[str(rejected)]
+    with patch("time.monotonic", return_value=deadline + 1):
+      self.assertEqual(self.uploader.next_file_to_upload(False)[2], str(rejected))
+    self.assertIsNone(getxattr(str(rejected), self.module["UPLOAD_ATTR_NAME"]))
+
+  def test_uploader_restart_keeps_live_locks_and_clears_only_when_logger_exits(self):
+    segment = self.make_segment()
+    self.make_file(segment, "rlog.zst")
+    lock = self.make_file(segment, "rlog.lock")
+    camera_lock = self.make_file(segment, "fcamera.hevc.lock")
+    with (self.root / ".loggerd.lock").open("a") as recording_lock:
+      fcntl.flock(recording_lock, fcntl.LOCK_SH)
+      self.module["clear_locks"](str(self.root))
+      self.assertTrue(lock.exists())
+      self.assertTrue(camera_lock.exists())
+      self.assertIsNone(self.uploader.next_file_to_upload(False))
+    self.module["clear_locks"](str(self.root))
+    self.assertFalse(lock.exists())
+    self.assertFalse(camera_lock.exists())
+    self.assertIsNotNone(self.uploader.next_file_to_upload(False))
+
+  def test_main_loop_does_not_sleep_past_retry_before_other_routes_upload(self):
+    segment = self.make_segment()
+    rejected = self.make_file(segment, "qlog.zst")
+    normal = self.make_segment("00000002--0123456789--0", bench=False)
+    qlog = self.make_file(normal, "qlog.zst")
+    self.api.get.return_value = SimpleNamespace(status_code=412)
+    params = Mock()
+    params.get.return_value = "test-device"
+    params.get_bool.return_value = False
+    sm = MagicMock()
+    sm.__getitem__.return_value = SimpleNamespace(networkType=SimpleNamespace(raw=1), networkMetered=False)
+    self.globals["messaging"].SubMaster.return_value = sm
+    exit_event = Mock()
+    exit_event.is_set.side_effect = [False, False, True]
+    with patch.dict(self.globals, {
+      "Uploader": lambda *args: self.uploader, "Params": lambda: params, "allow_sleep": True, "force_wifi": False,
+      "Paths": SimpleNamespace(log_root=lambda: str(self.root)),
+    }), patch("time.sleep") as sleep:
+      self.module["main"](exit_event)
+    self.assertIsNone(getxattr(str(rejected), self.module["UPLOAD_ATTR_NAME"]))
+    self.assertEqual(getxattr(str(qlog), self.module["UPLOAD_ATTR_NAME"]), b"1")
+    self.assertEqual(self.api.get.call_count, 2)
+    self.assertTrue(all(call.args[0] < 1 for call in sleep.call_args_list))
 
 
 if __name__ == "__main__":

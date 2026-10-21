@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import datetime
+import fcntl
 from collections.abc import Iterator
 
 from openpilot.cereal import log
@@ -67,14 +68,20 @@ def listdir_by_creation(d: str) -> list[str]:
     return []
 
 def clear_locks(root: str) -> None:
-  for logdir in os.listdir(root):
-    path = os.path.join(root, logdir)
+  # loggerd holds a shared lock until all recording writers have closed.
+  with open(os.path.join(root, ".loggerd.lock"), "a") as recording_lock:
     try:
-      for fname in os.listdir(path):
-        if fname.endswith(".lock"):
-          os.unlink(os.path.join(path, fname))
-    except OSError:
-      cloudlog.exception("clear_locks failed")
+      fcntl.flock(recording_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      return
+    for logdir in listdir_by_creation(root):
+      path = os.path.join(root, logdir)
+      try:
+        for fname in os.listdir(path):
+          if fname.endswith(".lock"):
+            os.unlink(os.path.join(path, fname))
+      except OSError:
+        cloudlog.exception("clear_locks failed")
 
 
 class Uploader:
@@ -87,6 +94,8 @@ class Uploader:
 
     # stats for last successfully uploaded file
     self.last_filename = ""
+    self.retry_after: dict[str, tuple[float, float]] = {}
+    self.last_failure_bench = False
 
     self.immediate_folders = ["crash/", "boot/"]
     self.immediate_priority = {"qlog": 0, "qlog.zst": 0, "qcamera.ts": 1}
@@ -134,7 +143,8 @@ class Uploader:
         yield name, key, fn
 
   def next_file_to_upload(self, metered: bool) -> tuple[str, str, str] | None:
-    upload_files = list(self.list_upload_files(metered))
+    now = time.monotonic()
+    upload_files = [item for item in self.list_upload_files(metered) if self.retry_after.get(item[2], (0., 0.))[0] <= now]
 
     for name, key, fn in upload_files:
       if any(f in fn for f in self.immediate_folders):
@@ -234,6 +244,7 @@ class Uploader:
 
 
   def step(self, network_type: int, metered: bool) -> bool | None:
+    self.last_failure_bench = False
     d = self.next_file_to_upload(metered)
     if d is None:
       return None
@@ -244,7 +255,18 @@ class Uploader:
     if key.endswith(('qlog', 'rlog')) or (key.startswith('boot/') and not key.endswith('.zst')):
       key += ".zst"
 
-    return self.upload(name, key, fn, network_type, metered)
+    success = self.upload(name, key, fn, network_type, metered)
+    if success:
+      self.retry_after.pop(fn, None)
+    else:
+      try:
+        if self.is_bench_file(name, fn):
+          delay = min(max(self.retry_after.get(fn, (0., 0.))[1] * 2, 5.), 120.)
+          self.retry_after[fn] = (time.monotonic() + delay, delay)
+          self.last_failure_bench = True
+      except OSError:
+        pass
+    return success
 
 
 def main(exit_event: threading.Event | None = None) -> None:
@@ -285,7 +307,9 @@ def main(exit_event: threading.Event | None = None) -> None:
       backoff = 0.1
     else:
       cloudlog.info("upload backoff %r", backoff)
-      backoff = min(backoff*2, 120)
+      # Bench retries are per-file; a global failure sleep would let the same
+      # rejected qlog become eligible again before later recordings get a turn.
+      backoff = 0.1 if uploader.last_failure_bench else min(backoff*2, 120)
     if allow_sleep:
       time.sleep(backoff + random.uniform(0, backoff))
 
