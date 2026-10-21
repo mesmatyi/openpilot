@@ -281,13 +281,14 @@ class TestBenchProcessSelection(unittest.TestCase):
 
 
 class TestBenchAdapter(unittest.TestCase):
-  def run_adapter(self, fault=None):
+  def run_adapter(self, fault=None, warmup=False):
     params, sm = MockParams(), MockHardware()
     for key in ("BenchMode", "BenchModeRequested"):
       params.put_bool(key, True)
     params.put("BenchModeLease", 100.0)
     params.put = Mock(wraps=params.put)
     sm.seen = {"pandaStates": True}
+    sm.valid["pandaStates"] = not warmup
     sm.update = lambda timeout: None
     pm = Mock()
 
@@ -299,6 +300,8 @@ class TestBenchAdapter(unittest.TestCase):
 
       def keep_time(self):
         self.frame += 1
+        if warmup and self.frame == 2:
+          sm.valid["pandaStates"] = True
         if self.frame == 3 and fault is not None:
           if fault == "lease":
             params.remove("BenchModeLease")
@@ -353,6 +356,12 @@ class TestBenchAdapter(unittest.TestCase):
         _, params, pm, _ = self.run_adapter(fault)
         self.assertEqual(sum(call.args[0] == "carState" for call in pm.send.call_args_list), 3)
         self.assertIsNone(params.get("BenchAdapterHeartbeat"))
+
+  def test_initial_seen_message_is_not_yet_frequency_checked(self):
+    _, params, pm, _ = self.run_adapter(warmup=True)
+    self.assertEqual(sum(call.args[0] == "carState" for call in pm.send.call_args_list), 10)
+    self.assertEqual(params.get("CarParams"), b"bench-cp")
+    self.assertIsNone(params.get("BenchAdapterHeartbeat"))
 
 
 class TestBenchUI(unittest.TestCase):

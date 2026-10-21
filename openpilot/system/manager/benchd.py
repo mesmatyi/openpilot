@@ -33,8 +33,8 @@ def main():
       if not fresh(params.get("BenchModeLease"), now, LEASE_TIMEOUT):
         break
       if not hardware_safe(sm, now):
-        # Allow the first real panda message to arrive, without claiming readiness.
-        if sm.seen["pandaStates"]:
+        # Frequency checks need multiple real samples. Never claim readiness while warming up.
+        if initialized:
           break
         rk.keep_time()
         continue
