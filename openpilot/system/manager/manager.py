@@ -15,6 +15,7 @@ from openpilot.common.hardware import HARDWARE
 from openpilot.system.manager.helpers import unblock_stdout, save_bootlog
 from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
+from openpilot.system.manager.bench import BENCH_ALWAYS, BenchController, clear_car_session
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
@@ -86,6 +87,9 @@ def manager_init() -> None:
                        device=HARDWARE.get_device_type())
 
 def manager_cleanup() -> None:
+  params = Params()
+  params.put_bool("BenchModeRequested", False, block=True)
+  params.remove("BenchModeLease")
   # send signals to kill all procs
   for p in managed_processes.values():
     p.stop(block=False)
@@ -94,6 +98,10 @@ def manager_cleanup() -> None:
   for p in managed_processes.values():
     p.stop(block=True)
 
+  if params.get_bool("BenchMode"):
+    clear_car_session(params)
+    params.remove("BenchAdapterHeartbeat")
+    # Keep the no-output lock until the next manager startup.
   cloudlog.info("everything is dead")
 
 
@@ -103,6 +111,7 @@ def manager_thread() -> None:
   cloudlog.info({"environ": os.environ})
 
   params = Params()
+  bench = BenchController(params, supported=HARDWARE.get_device_type() == "mici")
 
   ignore: list[str] = []
   if params.get("DongleId") in (None, UNREGISTERED_DONGLE_ID):
@@ -123,12 +132,28 @@ def manager_thread() -> None:
   while True:
     sm.update(1000)
 
-    started = sm['deviceState'].started
+    adapter = managed_processes["benchd"].proc
+    entering_bench = bench.update(sm, adapter_failed=adapter is not None and adapter.exitcode is not None)
+    if entering_bench or bench.stopping:
+      # ensure_running stops asynchronously: join publishers before handing ownership over.
+      for name, process in managed_processes.items():
+        if name not in BENCH_ALWAYS:
+          process.stop(block=True)
 
+    started = sm['deviceState'].started
+    if bench.stopping:
+      started = False
+
+    # Preserve user logging choice and the adapter's transient CP across synthetic transitions.
+    bench_values = {k: params.get(k) for k in ("CarParams", "DisableLogging")} if params.get_bool("BenchMode") else {}
     if started and not started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
     elif not started and started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+    if started != started_prev:
+      for key, value in bench_values.items():
+        if value is not None:
+          params.put(key, value, block=True)
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
@@ -142,6 +167,8 @@ def manager_thread() -> None:
     ignition_prev = ignition
 
     ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=ignore)
+    if bench.stopping:
+      bench.finish_stop(sm)
 
     running = ' '.join("{}{}\u001b[0m".format("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
                        for p in managed_processes.values() if p.proc)

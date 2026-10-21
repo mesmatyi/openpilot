@@ -6,6 +6,7 @@ from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.common.hardware import PC, COMMA_HARDWARE
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
+from openpilot.system.manager.bench import process_allowed
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
@@ -19,7 +20,7 @@ def iscar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not CP.notCar
 
 def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
-  run = (not CP.notCar) or not params.get_bool("DisableLogging")
+  run = (not CP.notCar and not params.get_bool("BenchMode")) or not params.get_bool("DisableLogging")
   return started and run
 
 def ublox_available() -> bool:
@@ -68,6 +69,7 @@ def and_(*fns):
   return lambda *args: operator.and_(*(fn(*args) for fn in fns))
 
 procs = [
+  PythonProcess("benchd", "openpilot.system.manager.benchd", always_run),
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
 
   NativeProcess("loggerd", "openpilot/system/loggerd", ["./loggerd"], logging),
@@ -119,5 +121,12 @@ procs = [
   PythonProcess("webrtcd", "openpilot.system.webrtc.webrtcd", or_(livestream, notcar)),
   PythonProcess("joystick", "openpilot.tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
+
+def bench_guard(name, predicate):
+  return lambda started, params, CP: process_allowed(name, started, params) and predicate(started, params, CP)
+
+
+for p in procs:
+  p.should_run = bench_guard(p.name, p.should_run)
 
 managed_processes = {p.name: p for p in procs}

@@ -285,7 +285,7 @@ def main():
   input_invalid_threshold = {s: input_invalid_limit[s] - 0.5 for s in critical_services}
   input_invalid_decay = {s: calculate_invalid_input_decay(input_invalid_limit[s], INPUT_INVALID_RECOVERY, SERVICE_LIST[s].frequency) for s in critical_services}
 
-  initial_pose_data = params.get("LocationFilterInitialState")
+  initial_pose_data = None if params.get_bool("BenchMode") else params.get("LocationFilterInitialState")
   if initial_pose_data is not None:
     with log.Event.from_bytes(initial_pose_data) as lp_msg:
       filter_state = lp_msg.deviceMotion.debugFilterState
