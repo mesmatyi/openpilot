@@ -21,6 +21,11 @@ uv run python -m openpilot.tools.mcap.convert \
   '<dongle-id>/<route-id>/0:1' --output route-ros2.mcap \
   --topics narrow-road-camera wide-road-camera gps-fix gps-velocity \
     raw-acceleration raw-angular-velocity vehicle-speed steering-angle
+
+# Also add per-image CameraInfo and the logged extrinsic calibration (/tf).
+uv run python -m openpilot.tools.mcap.convert \
+  '<dongle-id>/<route-id>/0:1' --output route-calibrated.mcap \
+  --topics narrow-road-camera wide-road-camera --camera-info
 ```
 
 `--topics` is required. Unselected fields and original event envelopes are not
@@ -49,6 +54,85 @@ cache are reused. Reduced qlogs are not substituted for rlogs.
 | `lead-vehicles` | `visualization_msgs/msg/MarkerArray` | `/model/leads`: current model lead ground indicator and distance label |
 | `target-acceleration` | `std_msgs/msg/Float64` | `/planning/target_acceleration` |
 
+Two opt-in flags add camera calibration topics for the selected cameras:
+`--camera-info` (`sensor_msgs/msg/CameraInfo` on `/camera/<name>/camera_info`
+plus `/tf`) and `--camera-overlays`, described below.
+
+## Camera calibration info
+
+Opt in with `--camera-info` to add calibration for **every selected camera
+stream**, including `cabin-camera`. Without it, camera topics are exported as before.
+
+- `/camera/<name>/camera_info`: `sensor_msgs/msg/CameraInfo` for every decoded
+  image, with the image's exact header (start-of-frame readout stamp
+  `EncodeIndex.timestampSof` and optical `frame_id`), as ROS image/camera_info
+  consumers expect.
+- `/tf`: when a road camera is selected, the logged `extrinsicsCalibration` as
+  transforms from `device_flu` to `model_flu` and the selected road optical
+  frames. These are the same transforms, under the same calibrated-only rule,
+  that `--camera-overlays` adds (see below). Unlike overlay mode, a route without
+  usable calibration still exports its intrinsics, and a warning reports that
+  the optical frames are not connected to `device_flu`. Add
+  `--allow-uncalibrated-overlays` to also accept valid `uncalibrated` updates;
+  it requires a selected road camera. The cabin camera has no logged extrinsics
+  and stays disconnected.
+
+**openpilot logs contain no lens calibration.** The only camera calibration in
+an rlog is extrinsic: `extrinsicsCalibration` (mounting rotation `rpyCalib`,
+wide-camera rotation `wideFromDeviceEuler`, camera `height`). Intrinsics are
+therefore openpilot's nominal per-hardware pinhole values (`DEVICE_CAMERAS`),
+selected by the logged `deviceState.deviceType` and `<camera>CameraState.sensor`.
+These are the values modeld uses to warp frames and the onroad UI uses to draw,
+not a calibration of the individual device:
+
+- `K` uses the profile's focal length for both axes and openpilot's nominal
+  principal point (width/2, height/2), not a measured optical center. A comma
+  four (`mici`, `os04c10`) gives the narrow road camera 1344x760 with f=1141.5 px,
+  and the wide road and cabin cameras 1344x760 with f=425.25 px.
+- `distortion_model` is `plumb_bob` with five zero coefficients: openpilot's
+  distortion-free pinhole approximation. ROS and Foxglove tools will treat the
+  images as already undistorted (`image_proc` rectification is a no-op, and
+  Foxglove's **Rectify** leaves the pixels unchanged, although it must stay on
+  to draw 3D overlays), while the real lenses are distorted, strongly so for the
+  fisheye wide-road and cabin cameras. Alignment degrades toward the image edges.
+- `R` is identity, `P` is `[K|0]`, binning is 0, and the ROI is the full image.
+- On a sample comma four route, the images implied a narrow/wide focal-length
+  ratio a few percent below the nominal profiles. Absolute per-device accuracy
+  is unmeasured.
+
+The profile used for each camera, the hardware key, and these caveats are
+recorded in the `camera_intrinsics` metadata record. Profiles reached through
+openpilot's alias entries (for example `tici`/`unknown`, assumed AR0231) are
+marked as assumed hardware. Unknown hardware, a camera missing from the profile,
+absent hardware metadata, and decoded-size mismatches fail explicitly.
+
+### Placeholder calibration on notCar routes
+
+Routes whose logged `carParams.notCar` is set carry a placeholder extrinsic
+calibration. In opendbc, `notCar` marks non-car robotics platforms; stock
+openpilot sets it only for the comma body. A stock device on an unrecognized car
+logs brand `mock` with `notCar=false` (dashcam mode), keeps normal calibrationd
+behavior, and is labeled `calibrationd`. The sample comma four route used during
+development logs a synthetic notCar CarParams (brand `mock`, no fingerprint)
+that stock card does not produce, as a bench setup might.
+
+With `notCar` set, calibrationd publishes `calStatus=calibrated`, `calPerc=100`,
+`validBlocks=5`, and `rpyCalib=[0,0,0]` whatever it measures.
+`wideFromDeviceEuler` and `height` keep their startup values (saved
+`CalibrationParams` if present, otherwise `[0,0,0]` and 1.22 m), unless the
+platform reports more than 15 mph while driving straight, when calibrationd
+still updates them. modeld builds its input warp from `rpyCalib` and the nominal
+intrinsics only, and the onroad UI also applies `wideFromDeviceEuler` to the
+wide camera, as the exported wide optical frame does. So `model_flu` matches
+openpilot's model frame and the overlays match the UI, but the transforms **do
+not describe how the device is mounted**.
+
+Each accepted update is counted in the `camera_calibration_basis` metadata
+record as `notcar_placeholder`, `calibrationd`, or `unknown`, from the segment's
+logged `carParams` and falling back to the `CarParams` entry in `initData`.
+Placeholder updates also print a `PLACEHOLDER camera calibration` warning.
+calibrationd reads CarParams only once at startup, so the label is a proxy.
+
 ## Camera overlays in Foxglove
 
 Opt in with `--camera-overlays` to add the standard ROS 2 calibration and
@@ -62,11 +146,14 @@ uv run python -m openpilot.tools.mcap.convert \
 ```
 
 The flag requires at least one selected road camera. Existing exports are not
-modified, and exports without this flag retain their original camera behavior.
+modified, and exports that use neither `--camera-overlays` nor `--camera-info`
+retain their original camera behavior.
 Overlay mode adds:
 
 - `/camera/narrowRoad/camera_info` and/or `/camera/wideRoad/camera_info`:
-  `sensor_msgs/msg/CameraInfo`, at every image's capture timestamp and resolution.
+  `sensor_msgs/msg/CameraInfo`, at every image's capture timestamp and resolution,
+  as described in [Camera calibration info](#camera-calibration-info). Add
+  `--camera-info` to also get CameraInfo for a selected cabin camera.
 - `/tf`: `tf2_msgs/msg/TFMessage`, with `device_flu` as the parent of `model_flu`
   and the selected road optical frames. Model and wide-camera rotations come
   from valid, calibrated `extrinsicsCalibration.rpyCalib` and
@@ -77,11 +164,13 @@ Overlay mode adds:
 
 In Foxglove, add one **Image** panel per road camera. Choose its
 `/camera/<name>/image_raw/compressed` topic and corresponding
-`/camera/<name>/camera_info` under **Calibration**, then enable **Rectify**.
+`/camera/<name>/camera_info` under **Calibration**, then enable **Rectify**
+(required for 3D topics; with zero distortion it does not change the pixels).
 Under **Topics**, enable `/model/lane_lines/line_<index>/marker`, any selected
 road-edge/path markers, and `/model/leads`. Keep **Sync timestamps** off:
-images use exposure-start timestamps while model geometry uses the logged
-exposure-end timestamp. `/tf` supplies the connection to the optical frame;
+images use start-of-frame (readout start) stamps (`timestampSof`), while model
+geometry uses the logged end-of-frame stamp (`timestampEof`, start of frame
+plus the sensor readout time, 11 ms on os04c10). `/tf` supplies the connection to the optical frame;
 the original `model_flu` geometry does not need to be relabeled as camera data.
 See the [Foxglove Image panel documentation](https://docs.foxglove.dev/docs/visualization/panels/image).
 
@@ -98,6 +187,21 @@ These are rotation-only **projection frames**, with coincident origins as in
 openpilot's renderer, not surveyed physical camera positions. Raw IMU and GNSS
 frames remain disconnected because their spatial extrinsics are not established.
 
+modeld rebuilds its input warp from every `extrinsicsCalibration` message
+whatever its status, while the exported transforms use only calibrated updates,
+like the onroad UI. During calibration warm-up or invalid periods, model
+geometry can therefore be in a frame that has no exported transform. Transforms
+follow the calibration rate (about 4 Hz) and are never backdated, so tools that
+do not extrapolate TF (tf2, rviz) cannot place images stamped before the first
+or after the last accepted update. The tail can be long if calibration later
+becomes invalid or recalibrating.
+
+`/model/path` is the device's own predicted trajectory at camera height
+(z about 0 m), while lane lines and road edges sit at road level. openpilot's UI
+lowers the path by `extrinsicsCalibration.height` before drawing it; the export
+does not, so the path marker projects near the horizon. On notCar routes that
+height is a placeholder anyway.
+
 ### Explicitly allowing uncalibrated overlays
 
 Some recordings never complete calibration. To inspect approximate overlays
@@ -110,7 +214,7 @@ uv run python -m openpilot.tools.mcap.convert \
   --camera-overlays --allow-uncalibrated-overlays
 ```
 
-This requires `--camera-overlays` and additionally accepts **valid events**
+This requires `--camera-overlays` (or `--camera-info` with a selected road camera) and additionally accepts **valid events**
 whose calibration status is `uncalibrated`. Invalid events and `invalid` or
 `recalibrating` statuses remain excluded. Missing, malformed, or nonfinite
 rotation vectors still fail; no zero-angle fallback or calibration from
@@ -172,13 +276,42 @@ available when its file was actually uploaded.
   into `device_flu` (forward/left/up), including angular velocity. Known
   component variances populate covariance diagonals. Estimated IMU orientation
   is converted from NED/device coordinates to ENU/FLU; Euler-angle uncertainties
-  are not falsely presented as quaternion-error covariance.
+  are not falsely presented as quaternion-error covariance. Known limitation:
+  openpilot logs `cameraOdometry` in its calibrated (model) frame, despite the
+  schema's "device frame" comment, so `/motion/camera_velocity` is exactly
+  `device_flu` only while the logged `rpyCalib` is zero (for example on notCar
+  routes). Otherwise it is rotated by the mounting calibration.
 - GNSS velocity is a linear-only ENU `Vector3Stamped`, not a twist containing
   fabricated angular velocity. GNSS fixes preserve WGS84 latitude, longitude,
-  ellipsoidal altitude, and fix availability. Position covariance and
-  constellation service are explicitly unknown rather than inferred.
+  ellipsoidal altitude, and fix availability; constellation service stays unknown.
+- GNSS fix covariance: for u-blox fixes (`source` `ublox` with `hasFix`),
+  `position_covariance` is diag(hAcc², hAcc², vAcc²) in m² (east, north, up),
+  from the receiver's NAV-PVT accuracy estimates (`horizontalAccuracy`,
+  `verticalAccuracy`), with `COVARIANCE_TYPE_APPROXIMATED`. u-blox documents
+  these values only as accuracy estimates, without a confidence level. Like
+  common u-blox drivers, they are treated as 1-sigma per axis. That is exact if
+  hAcc is a per-axis sigma, and conservative (by about 2-2.3x in variance) if it
+  is a radial 68%/DRMS figure. hAcc has no east/north split or cross terms, so
+  both horizontal axes get hAcc², and Foxglove's Map panel (which draws the
+  1-sigma ellipse) shows a circle of radius hAcc. These
+  are the receiver filter's self-assessment, not verified error bounds. In a 2D
+  fix, vAcc describes the held altitude.
+- Samples without a fix keep zero covariance with `COVARIANCE_TYPE_UNKNOWN`, as
+  do fixes from any other `gpsLocationExternal` source. Devices without a u-blox
+  publish GNSS on `gpsLocation` (qcomgpsd, which stores VDOP there, not metres),
+  and `gps-fix` does not read it. Routes recorded before `hasFix` existed
+  (March 2024) also keep an unknown covariance; `flags` is deliberately not used
+  as a fallback, because simulator logs set it with made-up accuracies.
+- A u-blox fix with a non-finite or non-positive accuracy fails explicitly.
+  Speed and heading accuracies are not position uncertainties and are not
+  exported. `gps_fix_covariance_counts` metadata counts fixes per covariance type.
+- Covariance is not adjusted for GNSS timing. The receiver's covariance applies
+  at its fix epoch, while headers carry the log time, which on sampled routes is
+  about 0.1 s later for fixes (per-segment medians 94-123 ms). At speed, the
+  resulting along-track error can exceed hAcc, so fusion users should account
+  for this latency.
 - Predicted paths, lane lines, and road edges use `model_flu`, with right/down
-  axes flipped. With `--camera-overlays`, logged calibration connects this
+  axes flipped. With `--camera-overlays` or `--camera-info`, logged calibration connects this
   projection frame to `device_flu` and the road optical frames as described above.
   Path poses have identity orientation: they represent **position geometry**,
   not measured attitude. Predicted-position pose stamps include the source's
@@ -209,3 +342,9 @@ and encode/decode real HEVC-to-JPEG camera frames.
 Overlay tests verify both TF directions against openpilot's projection math,
 CameraInfo/image synchronization, nested UTC timestamps, standard marker
 decoding, current-versus-future lead semantics, and stale-marker removal.
+Camera-info tests check per-camera intrinsics (including the cabin camera),
+header synchronization across segments, both camera flags together, no
+calibration outputs in default exports and no cabin CameraInfo in overlay-only
+exports, missing hardware, and notCar placeholder labeling. GNSS tests check the u-blox covariance mapping,
+unknown covariance without a fix or for other sources, and rejected malformed
+accuracies.

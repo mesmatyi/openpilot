@@ -12,13 +12,14 @@ import av
 import numpy as np
 from PIL import Image
 from mcap.reader import NonSeekingReader, make_reader
+from opendbc.car.structs import car
 from rosbags.typesys import Stores, get_typestore, get_types_from_msg
 
 from openpilot.cereal import log
-from openpilot.common.transformations.camera import CameraConfig, DeviceCameraConfig, view_frame_from_device_frame
+from openpilot.common.transformations.camera import CameraConfig, DeviceCameraConfig, _NoneCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rotations_from_quats, rot_from_euler
 from openpilot.tools.lib.route import RouteName, Segment
-from openpilot.tools.mcap.convert import camera_configs, convert_route, main, video_messages
+from openpilot.tools.mcap.convert import calibration_basis, camera_configs, convert_route, intrinsics_description, main, video_messages
 from openpilot.tools.mcap.ros2 import (
   CompressedImage, DEVICE_TO_FLU, Marker, SIGNALS, TYPESTORE, camera_info, camera_transforms, header, lead_markers,
   log_messages, path_marker, path_message, signal_messages,
@@ -29,6 +30,9 @@ MODULE = "openpilot.tools.mcap.convert"
 UTC_TIME = 1_704_067_200_123_456_789
 TIME_OFFSET = UTC_TIME - 50
 CAMERA_CONFIG = DeviceCameraConfig(CameraConfig(64, 48, 80.0), CameraConfig(64, 48, 40.0), CameraConfig(64, 48, 40.0))
+# Distinct focal lengths per camera (narrow_road, cabin, wide_road) so CameraInfo cannot borrow another camera's intrinsics.
+INFO_CAMERA_CONFIG = DeviceCameraConfig(CameraConfig(64, 48, 80.0), CameraConfig(64, 48, 30.0), CameraConfig(64, 48, 40.0))
+OTHER_CAMERA_CONFIG = DeviceCameraConfig(CameraConfig(64, 48, 90.0), CameraConfig(64, 48, 35.0), CameraConfig(64, 48, 45.0))
 
 
 def event(name: str, timestamp: int = 1_000_000_000, *, valid: bool = True):
@@ -134,6 +138,50 @@ class TestCameraProjection(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Unsupported camera hardware"):
       camera_configs([device, camera], ["narrow-road-camera"])
 
+  def test_cabin_intrinsics_come_from_the_logged_hardware(self):
+    device = event("deviceState")
+    device.deviceState.deviceType = "mici"
+    cabin = event("cabinCameraState")
+    cabin.cabinCameraState.sensor = "os04c10"
+    config = camera_configs([device, cabin], ["cabin-camera"])["cabin-camera"]
+    self.assertEqual((config.width, config.height, config.focal_length), (1344, 760, 425.25))
+    self.assertEqual(intrinsics_description(("mici", "os04c10"), config), "mici/os04c10 1344x760 fx=fy=425.25 cx=672 cy=380")
+    self.assertIn("assumed", intrinsics_description(("tici", "unknown"), config))
+    # neo devices have no wide road camera; a placeholder config must never become CameraInfo.
+    device.deviceState.deviceType = "neo"
+    wide = event("wideRoadCameraState")
+    with self.assertRaisesRegex(ValueError, "has no wideRoad camera"):
+      camera_configs([device, wide], ["wide-road-camera"])
+
+
+class TestCalibrationBasis(unittest.TestCase):
+  def car_params(self, not_car: bool, *, valid: bool = True):
+    message = event("carParams", valid=valid)
+    message.carParams.notCar = not_car
+    return message
+
+  def init_data(self, entries: list[tuple[str, bytes]]):
+    message = event("initData")
+    for item, (key, value) in zip(message.initData.init("params").init("entries", len(entries)), entries, strict=True):
+      item.key, item.value = key, value
+    return message
+
+  def test_logged_car_params_take_precedence_and_must_be_valid(self):
+    self.assertEqual(calibration_basis([self.car_params(True, valid=False), self.car_params(False)]), "calibrationd")
+    self.assertEqual(calibration_basis([self.car_params(True), self.car_params(False)]), "unknown")
+    self.assertEqual(calibration_basis([self.car_params(True, valid=False)]), "unknown")
+    init = self.init_data([("CarParams", car.CarParams.new_message(notCar=False).to_bytes())])
+    self.assertEqual(calibration_basis([self.car_params(True), init]), "notcar_placeholder")
+
+  def test_init_data_fallback_reads_only_a_decodable_car_params_entry(self):
+    other = car.CarParams.new_message(notCar=False).to_bytes()
+    real = car.CarParams.new_message(notCar=True).to_bytes()
+    entries = [("CarParamsPersistent", other), ("CarParamsPrevRoute", other), ("CarParamsCache", other), ("CarParams", real)]
+    self.assertEqual(calibration_basis([self.init_data(entries)]), "notcar_placeholder")
+    for garbage in (b"garbage", b"\x00" * 3, real[: len(real) // 2], b""):
+      with self.subTest(garbage=garbage):
+        self.assertEqual(calibration_basis([self.init_data([("CarParams", garbage)])]), "unknown")
+
 
 class TestMappings(unittest.TestCase):
   def mapped(self, signal: str, message):
@@ -196,6 +244,43 @@ class TestMappings(unittest.TestCase):
     skipped = Counter()
     self.assertEqual(list(signal_messages("gps-velocity", data, message.logMonoTime, skipped)), [])
     self.assertEqual(skipped["gps-velocity: no GNSS fix"], 1)
+
+  def gps_message(self, *, source: str = "ublox", has_fix: bool = True, horizontal: float = 1.5, vertical: float = 2.5):
+    message = event("gpsLocationExternal")
+    data = message.gpsLocationExternal
+    data.source, data.hasFix = source, has_fix
+    data.latitude, data.longitude, data.altitude = 47.0, 19.0, 123.0
+    data.horizontalAccuracy, data.verticalAccuracy = horizontal, vertical
+    return message
+
+  def test_gps_fix_covariance_from_ublox_accuracy(self):
+    fix = self.mapped("gps-fix", self.gps_message())[0][2]
+    # East and north both get hAcc^2, up gets vAcc^2; no cross terms are logged.
+    np.testing.assert_array_equal(fix.position_covariance, [2.25, 0, 0, 0, 2.25, 0, 0, 0, 6.25])
+    self.assertEqual(fix.position_covariance_type, 1)  # COVARIANCE_TYPE_APPROXIMATED
+    self.assertEqual(fix.status.status, 0)
+
+  def test_gps_fix_covariance_stays_unknown_without_a_ublox_fix(self):
+    flags_only = self.gps_message(has_fix=False)
+    flags_only.gpsLocationExternal.flags = 1  # pre-hasFix logs and simulator logs: flags is deliberately not a fallback
+    cases = {
+      "u-blox without gnssFixOK": self.gps_message(has_fix=False, horizontal=1459.7, vertical=18.0),
+      "u-blox without fix, zero accuracy": self.gps_message(has_fix=False, horizontal=0.0, vertical=0.0),
+      "u-blox without fix, NaN accuracy": self.gps_message(has_fix=False, horizontal=float("nan"), vertical=float("nan")),
+      "u-blox with only flags bit 0": flags_only,
+      "qcomdiag stores VDOP": self.gps_message(source="qcomdiag", horizontal=0.0, vertical=1.5),
+      "android": self.gps_message(source="android"),
+    }
+    for name, message in cases.items():
+      with self.subTest(name):
+        fix = self.mapped("gps-fix", message)[0][2]
+        np.testing.assert_array_equal(fix.position_covariance, np.zeros(9))
+        self.assertEqual(fix.position_covariance_type, 0)
+
+  def test_malformed_ublox_accuracy_fails(self):
+    for horizontal, vertical in ((0.0, 1.0), (1.0, 0.0), (float("nan"), 1.0), (1.0, float("inf")), (-1.0, 1.0)):
+      with self.subTest(horizontal=horizontal, vertical=vertical), self.assertRaisesRegex(ValueError, "finite and positive"):
+        self.mapped("gps-fix", self.gps_message(horizontal=horizontal, vertical=vertical))
 
   def make_motion(self):
     message = event("deviceMotion")
@@ -519,6 +604,8 @@ class TestConversion(unittest.TestCase):
     self.assertEqual(warning.call_count, 2)
     _, _, metadata = self.read_messages()
     self.assertEqual(metadata["camera_calibration_counts"], {"calibrated": "1", "uncalibrated": "1"})
+    # The basis counts every accepted update, not rejected ones.
+    self.assertEqual(metadata["camera_calibration_basis"], {"unknown": "2"})
     self.assertEqual(metadata["skipped_samples"]["camera-overlays: unavailable calibration"], "3")
 
   def test_uncalibrated_opt_in_does_not_invent_missing_rotations(self):
@@ -588,8 +675,270 @@ class TestConversion(unittest.TestCase):
         with patch("sys.argv", argv), patch(f"{MODULE}.convert_route", return_value=Counter()) as convert, redirect_stdout(io.StringIO()):
           main()
         convert.assert_called_once_with(
-          ROUTE, self.output, topics=topics, camera_overlays=True, allow_uncalibrated_overlays=allow_uncalibrated,
+          ROUTE, self.output, topics=topics, camera_overlays=True, allow_uncalibrated_overlays=allow_uncalibrated, camera_info=False,
         )
+
+  def test_camera_info_cli_flag(self):
+    argv = ["convert", ROUTE, "--output", str(self.output), "--topics", "cabin-camera", "--camera-info"]
+    with patch("sys.argv", argv), patch(f"{MODULE}.convert_route", return_value=Counter()) as convert, redirect_stdout(io.StringIO()):
+      main()
+    convert.assert_called_once_with(
+      ROUTE, self.output, topics=["cabin-camera"], camera_overlays=False, allow_uncalibrated_overlays=False, camera_info=True,
+    )
+
+  def make_camera_segment(
+    self, cameras: tuple[str, ...] = ("narrowRoad", "wideRoad", "cabin"), *, with_calibration: bool = True,
+    not_car: bool | None = None, init_not_car: bool | None = None,
+  ) -> Segment:
+    device = event("deviceState", 70)
+    device.deviceState.deviceType = "mici"
+    events = [device]
+    if with_calibration:
+      events.append(calibration_event())
+    if not_car is not None:
+      params = event("carParams", 60)
+      params.carParams.notCar = not_car
+      events.append(params)
+    if init_not_car is not None:
+      init = event("initData", 55)
+      entry = init.initData.init("params").init("entries", 1)[0]
+      entry.key = "CarParams"
+      entry.value = car.CarParams.new_message(notCar=init_not_car).to_bytes()
+      events.append(init)
+    for camera in cameras:
+      state = event(f"{camera}CameraState", 80)
+      getattr(state, state.which()).sensor = "os04c10"
+      events.append(state)
+      events.extend(encode_event(i, 1_000 + i * 50, name=f"{camera}EncodeIdx") for i in range(2))
+    segment = self.make_segment(0, events)
+    video = self.make_video([np.full((48, 64, 3), 128, dtype=np.uint8)] * 2)
+    segment.camera_path = segment.ecamera_path = segment.dcamera_path = str(video)
+    self.route.segments = [segment]
+    return segment
+
+  def test_camera_info_for_every_selected_camera_with_logged_extrinsics(self):
+    self.make_camera_segment(not_car=False)
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "wide-road-camera", "cabin-camera"], camera_info=True)
+    messages, _, metadata = self.read_messages()
+    self.assertEqual(metadata["openpilot"]["camera_info"], "true")
+    self.assertEqual(metadata["openpilot"]["camera_overlays"], "false")
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "calibrated_only")
+    self.assertEqual(metadata["camera_calibration_counts"], {"calibrated": "1"})
+    self.assertEqual(metadata["camera_calibration_basis"], {"calibrationd": "1"})
+    self.assertIn("not measured", metadata["camera_intrinsics"]["source"])
+    self.assertIn("will not undistort", metadata["camera_intrinsics"]["distortion"])
+    cameras = (("narrowRoad", INFO_CAMERA_CONFIG.narrow_road), ("wideRoad", INFO_CAMERA_CONFIG.wide_road), ("cabin", INFO_CAMERA_CONFIG.cabin))
+    for camera, config in cameras:
+      with self.subTest(camera=camera):
+        self.assertEqual(counts[f"/camera/{camera}/camera_info"], counts[f"/camera/{camera}/image_raw/compressed"])
+        images = [(record, message) for channel, record, message in messages if channel.topic == f"/camera/{camera}/image_raw/compressed"]
+        infos = [(record, message) for channel, record, message in messages if channel.topic == f"/camera/{camera}/camera_info"]
+        self.assertEqual(len(infos), 2)
+        for (image_record, image), (info_record, info) in zip(images, infos, strict=True):
+          self.assertEqual(info_record.log_time, image_record.log_time)
+          self.assertEqual(info.header, image.header)
+          self.assertEqual((info.width, info.height), config.size)
+          self.assertEqual(info.distortion_model, "plumb_bob")
+          np.testing.assert_array_equal(info.d, np.zeros(5))
+          np.testing.assert_allclose(info.k, config.intrinsics.ravel())
+          np.testing.assert_array_equal(info.r, np.eye(3).ravel())
+          np.testing.assert_allclose(info.p, np.column_stack((config.intrinsics, np.zeros(3))).ravel())
+          self.assertEqual((info.binning_x, info.binning_y), (0, 0))
+          self.assertEqual((info.roi.x_offset, info.roi.y_offset, info.roi.height, info.roi.width, info.roi.do_rectify), (0, 0, 0, 0, False))
+        self.assertEqual(
+          metadata["camera_intrinsics"][camera], f"mici/os04c10 64x48 fx=fy={config.focal_length:g} cx=32 cy=24",
+        )
+    self.assertEqual(images[0][1].header.frame_id, "cabin_optical")
+    transforms = next(message for channel, _, message in messages if channel.topic == "/tf")
+    # The cabin camera has no logged extrinsics, so it stays disconnected rather than getting an invented transform.
+    self.assertEqual({transform.child_frame_id for transform in transforms.transforms}, {"model_flu", "narrow_road_optical", "wide_road_optical"})
+    self.assertFalse(any(channel.topic.endswith("/marker") for channel, _, _ in messages))
+
+  def test_camera_info_without_usable_extrinsics_still_exports_intrinsics(self):
+    self.make_camera_segment(("narrowRoad",), with_calibration=False)
+    uncalibrated = calibration_event()
+    uncalibrated.extrinsicsCalibration.calStatus = "uncalibrated"
+    with (self.root / "rlog0").open("ab") as stream:
+      stream.write(uncalibrated.to_bytes())
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}), patch(f"{MODULE}.cloudlog.warning") as warning:
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera"], camera_info=True)
+    self.assertEqual(counts["/camera/narrowRoad/camera_info"], 2)
+    self.assertNotIn("/tf", counts)
+    self.assertTrue(any("not connected to device_flu" in call.args[0] for call in warning.call_args_list))
+    _, _, metadata = self.read_messages()
+    self.assertEqual(metadata["skipped_samples"]["camera-info: unavailable calibration"], "1")
+    self.assertEqual(metadata["camera_calibration_counts"], {})
+    self.assertEqual(metadata["camera_calibration_basis"], {})
+    # The explicit opt-in that overlays use also applies to --camera-info.
+    self.output.unlink()
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}), patch(f"{MODULE}.cloudlog.warning"):
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera"], camera_info=True, allow_uncalibrated_overlays=True)
+    self.assertEqual(counts["/tf"], 1)
+    _, _, metadata = self.read_messages()
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "allow_uncalibrated")
+    self.assertEqual(metadata["camera_calibration_counts"], {"uncalibrated": "1"})
+
+  def test_overlays_alone_keep_road_only_camera_info(self):
+    self.make_camera_segment()
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "cabin-camera"], camera_overlays=True)
+    self.assertEqual(counts["/camera/narrowRoad/camera_info"], 2)
+    self.assertEqual(counts["/camera/cabin/image_raw/compressed"], 2)
+    self.assertNotIn("/camera/cabin/camera_info", counts)
+    _, _, metadata = self.read_messages()
+    self.assertEqual(metadata["openpilot"]["camera_info"], "false")
+    self.assertEqual(set(metadata["camera_intrinsics"]) - {"source", "distortion", "principal_point"}, {"narrowRoad"})
+
+  def test_default_export_has_no_calibration_outputs(self):
+    self.make_camera_segment()
+    counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "cabin-camera"])
+    self.assertEqual(set(counts), {"/camera/narrowRoad/image_raw/compressed", "/camera/cabin/image_raw/compressed"})
+    _, _, metadata = self.read_messages()
+    self.assertEqual(metadata["openpilot"]["camera_info"], "false")
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "disabled")
+    for name in ("camera_intrinsics", "camera_calibration_counts", "camera_calibration_basis", "gps_fix_covariance_counts"):
+      self.assertNotIn(name, metadata)
+
+  def test_camera_info_requires_a_selected_camera(self):
+    with self.assertRaisesRegex(ValueError, "--camera-info requires at least one selected camera"):
+      convert_route(ROUTE, self.output, topics=["vehicle-speed"], camera_info=True)
+    self.assertFalse(self.output.exists())
+
+  def test_cabin_only_camera_info_has_no_extrinsics(self):
+    self.make_camera_segment(("cabin",))
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}), patch(f"{MODULE}.cloudlog.warning") as warning:
+      counts = convert_route(ROUTE, self.output, topics=["cabin-camera"], camera_info=True)
+    self.assertEqual(counts, {"/camera/cabin/image_raw/compressed": 2, "/camera/cabin/camera_info": 2})
+    warning.assert_not_called()
+    messages, _, metadata = self.read_messages()
+    info = next(message for channel, _, message in messages if channel.topic == "/camera/cabin/camera_info")
+    np.testing.assert_allclose(info.k, INFO_CAMERA_CONFIG.cabin.intrinsics.ravel())
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "disabled")
+    self.assertNotIn("APPROXIMATE", metadata["openpilot"]["camera_projection"])
+    self.assertNotIn("camera_calibration_counts", metadata)
+    self.assertNotIn("camera_calibration_basis", metadata)
+    # The uncalibrated opt-in would have nothing to act on, so it is rejected instead of being silently ignored.
+    other = self.root / "other.mcap"
+    with self.assertRaisesRegex(ValueError, "requires a selected road camera"):
+      convert_route(ROUTE, other, topics=["cabin-camera"], camera_info=True, allow_uncalibrated_overlays=True)
+    self.assertFalse(other.exists())
+
+  def test_camera_info_and_overlays_together(self):
+    self.make_camera_segment(("narrowRoad", "cabin"))
+    invalid = calibration_event(85)
+    invalid.valid = False
+    with (self.root / "rlog0").open("ab") as stream:
+      stream.write(b"".join(item.to_bytes() for item in (model_event(1_000), model_event(1_050), invalid)))
+    topics = ["narrow-road-camera", "cabin-camera", "lane-lines"]
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+      counts = convert_route(ROUTE, self.output, topics=topics, camera_overlays=True, camera_info=True)
+    messages, _, metadata = self.read_messages()
+    self.assertEqual((metadata["openpilot"]["camera_overlays"], metadata["openpilot"]["camera_info"]), ("true", "true"))
+    self.assertEqual(counts["/tf"], 1)
+    self.assertEqual(counts["/model/lane_lines/line_0/marker"], 2)
+    self.assertEqual(metadata["skipped_samples"], {"camera-overlays: unavailable calibration": "1"})
+    for camera, config in (("narrowRoad", INFO_CAMERA_CONFIG.narrow_road), ("cabin", INFO_CAMERA_CONFIG.cabin)):
+      with self.subTest(camera=camera):
+        images = [message for channel, _, message in messages if channel.topic == f"/camera/{camera}/image_raw/compressed"]
+        infos = [message for channel, _, message in messages if channel.topic == f"/camera/{camera}/camera_info"]
+        self.assertEqual(len(infos), 2)
+        for image, info in zip(images, infos, strict=True):
+          self.assertEqual(info.header, image.header)
+          np.testing.assert_allclose(info.k, config.intrinsics.ravel())
+    # Overlays still require extrinsics even when --camera-info is also given.
+    self.output.unlink()
+    self.make_camera_segment(("narrowRoad", "cabin"), with_calibration=False)
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}), self.assertRaisesRegex(ValueError, "/tf"):
+      convert_route(ROUTE, self.output, topics=["narrow-road-camera", "cabin-camera"], camera_overlays=True, camera_info=True)
+    self.assertFalse(self.output.exists())
+
+  def test_camera_info_across_segments_uses_each_segments_hardware_and_basis(self):
+    video = str(self.make_video([np.full((48, 64, 3), 128, dtype=np.uint8)] * 2))
+    segments = []
+    for number, device_type, not_car in ((0, "mici", True), (1, "tizi", False)):
+      base = number * 1_000
+      device = event("deviceState", base + 70)
+      device.deviceState.deviceType = device_type
+      params = event("carParams", base + 60)
+      params.carParams.notCar = not_car
+      events = [device, params, *(calibration_event(base + 90 + i) for i in range(2 - number))]
+      if number == 0:
+        invalid = calibration_event(85)
+        invalid.valid = False
+        events.append(invalid)
+      for camera in ("narrowRoad", "cabin"):
+        state = event(f"{camera}CameraState", base + 80)
+        getattr(state, state.which()).sensor = "os04c10"
+        events.append(state)
+        events.extend(encode_event(i, base + 1_000 + i * 50, segment=number, name=f"{camera}EncodeIdx") for i in range(2))
+      segment = self.make_segment(number, events, with_clock=number == 0)
+      segment.camera_path = segment.dcamera_path = video
+      segments.append(segment)
+    self.route.segments = segments
+    self.route.max_seg_number = 1
+    profiles = {("mici", "os04c10"): INFO_CAMERA_CONFIG, ("tizi", "os04c10"): OTHER_CAMERA_CONFIG}
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", profiles), patch(f"{MODULE}.cloudlog.warning"):
+      convert_route(ROUTE, self.output, topics=["narrow-road-camera", "cabin-camera"], camera_info=True)
+    messages, _, metadata = self.read_messages()
+    self.assertEqual(metadata["camera_calibration_basis"], {"calibrationd": "1", "notcar_placeholder": "2"})
+    self.assertEqual(metadata["skipped_samples"], {"camera-info: unavailable calibration": "1"})
+    for camera, field in (("narrowRoad", "narrow_road"), ("cabin", "cabin")):
+      with self.subTest(camera=camera):
+        images = [(record, message) for channel, record, message in messages if channel.topic == f"/camera/{camera}/image_raw/compressed"]
+        infos = [(record, message) for channel, record, message in messages if channel.topic == f"/camera/{camera}/camera_info"]
+        self.assertEqual([record.sequence for record, _ in infos], [0, 1, 2, 3])
+        for index, ((image_record, image), (info_record, info)) in enumerate(zip(images, infos, strict=True)):
+          self.assertEqual(info_record.log_time, image_record.log_time)
+          self.assertEqual(info.header, image.header)
+          expected = getattr(INFO_CAMERA_CONFIG if index < 2 else OTHER_CAMERA_CONFIG, field)
+          np.testing.assert_allclose(info.k, expected.intrinsics.ravel())
+        descriptions = metadata["camera_intrinsics"][camera].split("; ")
+        self.assertEqual([description.split()[0] for description in descriptions], ["mici/os04c10", "tizi/os04c10"])
+
+  def test_camera_info_rejects_unknown_or_missing_hardware(self):
+    self.make_camera_segment(("cabin",))
+    no_cabin = DeviceCameraConfig(CameraConfig(64, 48, 80.0), _NoneCameraConfig(), CameraConfig(64, 48, 40.0))
+    for cameras, reason in (({("mici", "os04c10"): no_cabin}, "has no cabin camera"), ({}, "Unsupported camera hardware")):
+      with self.subTest(reason=reason):
+        self.output.unlink(missing_ok=True)
+        with patch.dict(f"{MODULE}.DEVICE_CAMERAS", cameras, clear=True), self.assertRaisesRegex(ValueError, reason):
+          convert_route(ROUTE, self.output, topics=["cabin-camera"], camera_info=True)
+        self.assertFalse(self.output.exists())
+
+  def test_notcar_placeholder_calibration_is_labeled(self):
+    cases = (
+      ({"not_car": True}, "notcar_placeholder", 1),
+      ({"init_not_car": True}, "notcar_placeholder", 1),
+      ({"not_car": False, "init_not_car": True}, "calibrationd", 0),
+      ({}, "unknown", 0),
+    )
+    for options, basis, placeholder_warnings in cases:
+      with self.subTest(options=options):
+        self.output.unlink(missing_ok=True)
+        self.make_camera_segment(("narrowRoad",), **options)
+        with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}), patch(f"{MODULE}.cloudlog.warning") as warning:
+          convert_route(ROUTE, self.output, topics=["narrow-road-camera"], camera_overlays=True)
+        _, _, metadata = self.read_messages()
+        self.assertEqual(metadata["camera_calibration_counts"], {"calibrated": "1"})
+        self.assertEqual(metadata["camera_calibration_basis"], {basis: "1"})
+        self.assertEqual(sum("PLACEHOLDER" in call.args[0] for call in warning.call_args_list), placeholder_warnings)
+
+  def test_gps_fix_covariance_round_trip_and_counts(self):
+    fixed, unfixed = event("gpsLocationExternal", 100), event("gpsLocationExternal", 200)
+    for message, has_fix in ((fixed, True), (unfixed, False)):
+      data = message.gpsLocationExternal
+      data.source, data.hasFix = "ublox", has_fix
+      data.horizontalAccuracy, data.verticalAccuracy = 1.5, 2.5
+    self.route.segments = [self.make_segment(0, [fixed, unfixed])]
+    convert_route(ROUTE, self.output, topics=["gps-fix"])
+    messages, _, metadata = self.read_messages()
+    self.assertEqual(
+      [(message.position_covariance_type, message.position_covariance.tolist()) for _, _, message in messages],
+      [(1, [2.25, 0, 0, 0, 2.25, 0, 0, 0, 6.25]), (0, [0.0] * 9)],
+    )
+    self.assertEqual(metadata["gps_fix_covariance_counts"], {"approximated": "1", "unknown": "1"})
+    self.assertIn("diag(hAcc^2, hAcc^2, vAcc^2)", metadata["openpilot"]["gps_fix_covariance"])
 
   def test_native_cdr_round_trip_and_filtering(self):
     counts = convert_route(ROUTE, self.output, topics=["vehicle-speed"])

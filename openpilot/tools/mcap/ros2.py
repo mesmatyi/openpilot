@@ -239,6 +239,30 @@ def unavailable() -> np.ndarray:
   return covariance
 
 
+NAV_SAT_COVARIANCE_TYPES = {
+  NavSatFix.COVARIANCE_TYPE_UNKNOWN: "unknown",
+  NavSatFix.COVARIANCE_TYPE_APPROXIMATED: "approximated",
+  NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN: "diagonal_known",
+  NavSatFix.COVARIANCE_TYPE_KNOWN: "known",
+}
+
+
+def gnss_position_covariance(data) -> tuple[np.ndarray, int]:
+  # Only valid u-blox fixes carry metric accuracy estimates: ubloxd copies NAV-PVT hAcc/vAcc (mm -> m) and derives hasFix from
+  # gnssFixOK, and u-blox advises against using fixes without gnssFixOK. Any other gpsLocationExternal source keeps an unknown
+  # covariance: qcomgpsd stores VDOP but publishes gpsLocation (only a 2022 debug option put it on gpsLocationExternal), and
+  # simulator logs never set hasFix.
+  if not data.hasFix or str(data.source) != "ublox":
+    return np.zeros(9), NavSatFix.COVARIANCE_TYPE_UNKNOWN
+  horizontal, vertical = float(data.horizontalAccuracy), float(data.verticalAccuracy)
+  if not all(math.isfinite(value) and value > 0 for value in (horizontal, vertical)):
+    raise ValueError(f"gps-fix: u-blox accuracy estimates must be finite and positive (horizontal={horizontal}, vertical={vertical})")
+  # u-blox documents hAcc/vAcc only as accuracy estimates, without a confidence level. Like common u-blox drivers, treat each as a
+  # 1-sigma standard deviation. hAcc has no east/north split or cross terms, so it is applied to both horizontal axes (never
+  # optimistic for a circular error); that approximation is why the type is APPROXIMATED rather than DIAGONAL_KNOWN.
+  return np.diag([horizontal**2, horizontal**2, vertical**2]).ravel(), NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+
+
 def empty_imu(timestamp: int, frame: str) -> Imu:
   return Imu(
     header(timestamp, frame), Quaternion(0.0, 0.0, 0.0, 1.0), unavailable(), Vector3(0.0, 0.0, 0.0), unavailable(), Vector3(0.0, 0.0, 0.0), unavailable()
@@ -298,7 +322,7 @@ def signal_messages(signal: str, data, timestamp: int, skipped: Counter[str]) ->
         message.angular_velocity_covariance = np.zeros(9)
       yield topics[0], message
   elif signal == "gps-fix":
-    # Accuracy radii are not a full ENU covariance; report the covariance as unknown.
+    covariance, covariance_type = gnss_position_covariance(data)
     yield (
       topics[0],
       NavSatFix(
@@ -307,8 +331,8 @@ def signal_messages(signal: str, data, timestamp: int, skipped: Counter[str]) ->
         data.latitude,
         data.longitude,
         data.altitude,
-        np.zeros(9),
-        NavSatFix.COVARIANCE_TYPE_UNKNOWN,
+        covariance,
+        covariance_type,
       ),
     )
   elif signal == "gps-velocity":
