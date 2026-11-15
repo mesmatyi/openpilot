@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import datetime
+import fcntl
 from collections.abc import Iterator
 
 from openpilot.cereal import log
@@ -22,6 +23,12 @@ from openpilot.common.swaglog import cloudlog
 NetworkType = log.DeviceState.NetworkType
 UPLOAD_ATTR_NAME = 'user.upload'
 UPLOAD_ATTR_VALUE = b'1'
+BENCH_ATTR_NAME = 'user.bench'
+BENCH_ATTR_VALUE = b'1'
+BENCH_UPLOAD_FILES = frozenset({
+  "qlog", "qlog.zst", "rlog", "rlog.zst", "qcamera.ts",
+  "fcamera.hevc", "ecamera.hevc", "dcamera.hevc",
+})
 
 MAX_UPLOAD_SIZES = {
   "qlog": 25*1e6,  # can't be too restrictive here since we use qlogs to find
@@ -61,14 +68,20 @@ def listdir_by_creation(d: str) -> list[str]:
     return []
 
 def clear_locks(root: str) -> None:
-  for logdir in os.listdir(root):
-    path = os.path.join(root, logdir)
+  # loggerd holds a shared lock until all recording writers have closed.
+  with open(os.path.join(root, ".loggerd.lock"), "a") as recording_lock:
     try:
-      for fname in os.listdir(path):
-        if fname.endswith(".lock"):
-          os.unlink(os.path.join(path, fname))
-    except OSError:
-      cloudlog.exception("clear_locks failed")
+      fcntl.flock(recording_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      return
+    for logdir in listdir_by_creation(root):
+      path = os.path.join(root, logdir)
+      try:
+        for fname in os.listdir(path):
+          if fname.endswith(".lock"):
+            os.unlink(os.path.join(path, fname))
+      except OSError:
+        cloudlog.exception("clear_locks failed")
 
 
 class Uploader:
@@ -81,9 +94,14 @@ class Uploader:
 
     # stats for last successfully uploaded file
     self.last_filename = ""
+    self.retry_after: dict[str, tuple[float, float]] = {}
+    self.last_failure_bench = False
 
     self.immediate_folders = ["crash/", "boot/"]
     self.immediate_priority = {"qlog": 0, "qlog.zst": 0, "qcamera.ts": 1}
+
+  def is_bench_file(self, name: str, fn: str) -> bool:
+    return name in BENCH_UPLOAD_FILES and getxattr(os.path.dirname(fn), BENCH_ATTR_NAME) == BENCH_ATTR_VALUE
 
   def list_upload_files(self, metered: bool) -> Iterator[tuple[str, str, str]]:
     r = self.params.get("AthenadRecentlyViewedRoutes")
@@ -125,7 +143,8 @@ class Uploader:
         yield name, key, fn
 
   def next_file_to_upload(self, metered: bool) -> tuple[str, str, str] | None:
-    upload_files = list(self.list_upload_files(metered))
+    now = time.monotonic()
+    upload_files = [item for item in self.list_upload_files(metered) if self.retry_after.get(item[2], (0., 0.))[0] <= now]
 
     for name, key, fn in upload_files:
       if any(f in fn for f in self.immediate_folders):
@@ -134,6 +153,14 @@ class Uploader:
     for name, key, fn in upload_files:
       if name in self.immediate_priority:
         return name, key, fn
+
+    if not metered:
+      for name, key, fn in upload_files:
+        try:
+          if self.is_bench_file(name, fn) and os.path.isfile(fn) and not os.path.islink(fn):
+            return name, key, fn
+        except OSError:
+          cloudlog.exception("bench upload selection failed")
 
     return None
 
@@ -163,29 +190,35 @@ class Uploader:
   def upload(self, name: str, key: str, fn: str, network_type: int, metered: bool) -> bool:
     try:
       sz = os.path.getsize(fn)
+      bench_file = self.is_bench_file(name, fn)
     except OSError:
       cloudlog.exception("upload: getsize failed")
       return False
 
     cloudlog.event("upload_start", key=key, fn=fn, sz=sz, network_type=network_type, metered=metered)
+    last_exc = None
+
+    if bench_file and fake_upload:
+      cloudlog.event("upload_failed", key=key, fn=fn, reason="bench uploads require real transfer, not FAKEUPLOAD")
+      return False
 
     if sz == 0:
       # tag files of 0 size as uploaded
       success = True
-    elif name in MAX_UPLOAD_SIZES and sz > MAX_UPLOAD_SIZES[name]:
+    elif not bench_file and name in MAX_UPLOAD_SIZES and sz > MAX_UPLOAD_SIZES[name]:
       cloudlog.event("uploader_too_large", key=key, fn=fn, sz=sz)
       success = True
     else:
       start_time = time.monotonic()
 
       stat = None
-      last_exc = None
       try:
         stat = self.do_upload(key, fn)
       except Exception as e:
         last_exc = (e, traceback.format_exc())
 
-      if stat is not None and stat.status_code in (200, 201, 401, 403, 412):
+      accepted_statuses = (200, 201) if bench_file else (200, 201, 401, 403, 412)
+      if stat is not None and stat.status_code in accepted_statuses:
         self.last_filename = fn
         dt = time.monotonic() - start_time
         if stat.status_code == 412:
@@ -211,6 +244,7 @@ class Uploader:
 
 
   def step(self, network_type: int, metered: bool) -> bool | None:
+    self.last_failure_bench = False
     d = self.next_file_to_upload(metered)
     if d is None:
       return None
@@ -221,7 +255,18 @@ class Uploader:
     if key.endswith(('qlog', 'rlog')) or (key.startswith('boot/') and not key.endswith('.zst')):
       key += ".zst"
 
-    return self.upload(name, key, fn, network_type, metered)
+    success = self.upload(name, key, fn, network_type, metered)
+    if success:
+      self.retry_after.pop(fn, None)
+    else:
+      try:
+        if self.is_bench_file(name, fn):
+          delay = min(max(self.retry_after.get(fn, (0., 0.))[1] * 2, 5.), 120.)
+          self.retry_after[fn] = (time.monotonic() + delay, delay)
+          self.last_failure_bench = True
+      except OSError:
+        pass
+    return success
 
 
 def main(exit_event: threading.Event | None = None) -> None:
@@ -262,7 +307,9 @@ def main(exit_event: threading.Event | None = None) -> None:
       backoff = 0.1
     else:
       cloudlog.info("upload backoff %r", backoff)
-      backoff = min(backoff*2, 120)
+      # Bench retries are per-file; a global failure sleep would let the same
+      # rejected qlog become eligible again before later recordings get a turn.
+      backoff = 0.1 if uploader.last_failure_bench else min(backoff*2, 120)
     if allow_sleep:
       time.sleep(backoff + random.uniform(0, backoff))
 

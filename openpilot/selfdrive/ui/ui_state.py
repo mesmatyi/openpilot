@@ -123,7 +123,7 @@ class UIState:
 
   @property
   def engaged(self) -> bool:
-    return self.started and self.sm["selfdriveState"].enabled
+    return self.started and not self.params.get_bool("BenchMode") and self.sm["selfdriveState"].enabled
 
   def is_onroad(self) -> bool:
     return self.started
@@ -171,11 +171,12 @@ class UIState:
       self.light_sensor = -1
 
     # Update started state
-    self.started = self.sm["deviceState"].started and self.ignition
+    bench = self.params.get_bool("BenchMode")
+    self.started = self.sm["deviceState"].started and (self.ignition or bench)
 
     # Update body state
-    if self.CP is not None and self.is_body != self.CP.notCar:
-      self.is_body = self.CP.notCar
+    if self.CP is not None and self.is_body != (self.CP.notCar and not bench):
+      self.is_body = self.CP.notCar and not bench
       for callback in self._on_body_changed_callbacks:
         callback()
 
@@ -233,13 +234,16 @@ class UIState:
   def update_params(self) -> None:
     # For slower operations
     # Update longitudinal control state
-    CP_bytes = self.params.get("CarParamsPersistent")
+    CP_bytes = self.params.get("CarParams" if self.params.get_bool("BenchMode") else "CarParamsPersistent")
     if CP_bytes is not None:
       self.CP = messaging.log_from_bytes(CP_bytes, car.CarParams)
       if self.CP.alphaLongitudinalAvailable:
         self.has_longitudinal_control = self.params.get_bool("AlphaLongitudinalEnabled")
       else:
         self.has_longitudinal_control = self.CP.openpilotLongitudinalControl
+    else:
+      self.CP = None
+      self.has_longitudinal_control = False
 
     self.recording_audio = self.params.get_bool("RecordAudio") and self.started
     self.is_metric = self.params.get_bool("IsMetric")
@@ -369,7 +373,7 @@ class Device:
         callback()
     self._prev_timed_out = interaction_timeout
 
-    self._set_awake(ui_state.ignition or not interaction_timeout or PC)
+    self._set_awake(ui_state.ignition or ui_state.started or not interaction_timeout or PC)
 
   def _set_awake(self, on: bool):
     if on != self._awake:

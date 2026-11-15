@@ -58,6 +58,7 @@ Panda *connect(std::string serial) {
 
 void can_send_thread(Panda *panda, bool fake_send) {
   util::set_thread_name("pandad_can_send");
+  Params params;
 
   AlignedBuffer aligned_buf;
   std::unique_ptr<Context> context(Context::create());
@@ -69,6 +70,9 @@ void can_send_thread(Panda *panda, bool fake_send) {
   while (!do_exit && check_connected(panda)) {
     std::unique_ptr<Message> msg(subscriber->receive());
     if (!msg) {
+      continue;
+    }
+    if (params.getBool("BenchMode")) {
       continue;
     }
 
@@ -336,6 +340,10 @@ void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, 
     }
 
     // turn off IR leds if body
+    if (!is_onroad) {
+      not_car_checked = false;
+      not_car = false;
+    }
     if (!not_car_checked && is_onroad) {
       std::string cp_bytes = params.get("CarParams");
       if (cp_bytes.size() > 0) {
@@ -346,7 +354,7 @@ void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, 
         not_car_checked = true;
       }
     }
-    if (not_car) {
+    if (not_car && !params.getBool("BenchMode")) {
       ir_pwr = 0;
     }
 
@@ -360,6 +368,7 @@ void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, 
 }
 
 void pandad_run(Panda *panda) {
+  Params params;
   const bool no_fan_control = getenv("NO_FAN_CONTROL") != nullptr;
   const bool spoofing_started = getenv("STARTED") != nullptr;
   const bool fake_send = getenv("FAKESEND") != nullptr;
@@ -386,11 +395,12 @@ void pandad_run(Panda *panda) {
     // Process panda state at 10 Hz
     if (rk.frame() % 10 == 0) {
       sm.update(0);
-      engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
+      bool bench = params.getBool("BenchMode");
+      engaged = !bench && sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
       if (sm.updated("deviceState")) {
         is_onroad = sm["deviceState"].getDeviceState().getStarted();
       }
-      process_panda_state(panda, &pm, engaged, is_onroad, spoofing_started);
+      process_panda_state(panda, &pm, engaged, is_onroad, spoofing_started && !bench);
       panda_safety.configureSafetyMode(is_onroad);
     }
 

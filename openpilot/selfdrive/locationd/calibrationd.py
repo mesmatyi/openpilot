@@ -268,8 +268,10 @@ def main() -> NoReturn:
   params_reader = Params()
   CP = messaging.log_from_bytes(params_reader.get("CarParams", block=True), car.CarParams)
 
-  calibrator = Calibrator(param_put=True)
-  calibrator.not_car = CP.notCar
+  bench = params_reader.get_bool("BenchMode")
+  calibrator = Calibrator(param_put=not bench)
+  # A stationary bench cannot establish driving calibration, even though it is notCar.
+  calibrator.not_car = CP.notCar and not bench
 
   while 1:
     timeout = 0 if sm.frame == -1 else 100

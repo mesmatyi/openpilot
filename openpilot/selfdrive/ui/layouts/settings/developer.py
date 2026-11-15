@@ -2,7 +2,8 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.ssh_key import ssh_key_item
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import toggle_item
+from openpilot.system.ui.widgets.list_view import toggle_item, button_item
+from openpilot.selfdrive.ui.widgets.bench import confirm_bench_start
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.lib.application import gui_app
@@ -33,6 +34,12 @@ class DeveloperLayout(Widget):
     super().__init__()
     self._params = Params()
     self._is_release = self._params.get_bool("IsReleaseBranch")
+    self._bench_button = button_item(
+      "Bench Camera Mode (experimental)", "Start",
+      description=lambda: self._params.get("BenchModeStatus") or
+                          "Built-in cameras and sensors, without a vehicle. Recording/upload privacy settings apply. Stop using the persistent BENCH banner.",
+      callback=confirm_bench_start, enabled=ui_state.is_offroad,
+    )
 
     # Build items and keep references for callbacks/state updates
     self._adb_toggle = toggle_item(
@@ -91,6 +98,7 @@ class DeveloperLayout(Widget):
     self._on_enable_ui_debug(self._params.get_bool("ShowDebugInfo"))
 
     self._scroller = Scroller([
+      self._bench_button,
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys,
@@ -125,7 +133,8 @@ class DeveloperLayout(Widget):
       alpha_avail = ui_state.CP.alphaLongitudinalAvailable
       if not alpha_avail or self._is_release:
         self._alpha_long_toggle.set_visible(False)
-        self._params.remove("AlphaLongitudinalEnabled")
+        if not self._params.get_bool("BenchMode"):
+          self._params.remove("AlphaLongitudinalEnabled")
       else:
         self._alpha_long_toggle.set_visible(True)
 

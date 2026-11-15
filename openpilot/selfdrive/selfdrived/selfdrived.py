@@ -49,6 +49,7 @@ IGNORED_SAFETY_MODES = (SafetyModel.silent, SafetyModel.noOutput)
 class SelfdriveD:
   def __init__(self, CP=None):
     self.params = Params()
+    self.bench_mode = self.params.get_bool("BenchMode")
 
     # Ensure the current branch is cached, otherwise the first cycle lags
     build_metadata = get_build_metadata()
@@ -105,9 +106,9 @@ class SelfdriveD:
     car_recognized = self.CP.brand != 'mock'
 
     # cleanup old params
-    if not self.CP.alphaLongitudinalAvailable:
+    if not self.bench_mode and not self.CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
-    if not self.CP.openpilotLongitudinalControl:
+    if not self.bench_mode and not self.CP.openpilotLongitudinalControl:
       self.params.remove("ExperimentalMode")
 
     self.CS_prev = car.CarState.new_message()
@@ -531,7 +532,7 @@ class SelfdriveD:
     ss.enabled = self.enabled
     ss.active = self.active
     ss.state = self.state_machine.state
-    ss.engageable = not self.events.contains(ET.NO_ENTRY)
+    ss.engageable = not self.bench_mode and not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
 
@@ -556,7 +557,10 @@ class SelfdriveD:
   def step(self):
     CS = self.data_sample()
     self.update_events(CS)
-    if not self.CP.passive and self.initialized:
+    if self.bench_mode:
+      self.enabled = self.active = False
+      self.state_machine.state = State.disabled
+    elif not self.CP.passive and self.initialized:
       self.enabled, self.active = self.state_machine.update(self.events)
     self.update_alerts(CS)
 
