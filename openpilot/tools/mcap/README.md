@@ -19,13 +19,14 @@ uv run python -m openpilot.tools.mcap.convert \
 # Convert only the selected groups. Use /0:1 for a first-segment trial.
 uv run python -m openpilot.tools.mcap.convert \
   '<dongle-id>/<route-id>/0:1' --output route-ros2.mcap \
-  --topics narrow-road-camera wide-road-camera gps-fix gps-velocity \
-    raw-acceleration raw-angular-velocity vehicle-speed steering-angle
+  --topics narrow-road-camera wide-road-camera gps-fix gps-velocity gps-speed \
+    raw-acceleration raw-angular-velocity
 
-# Also add per-image CameraInfo and the logged extrinsic calibration (/tf).
+# Also add per-image CameraInfo and the logged extrinsic calibration (/tf):
+# one tree rooted at ground_link with both road optical frames.
 uv run python -m openpilot.tools.mcap.convert \
   '<dongle-id>/<route-id>/0:1' --output route-calibrated.mcap \
-  --topics narrow-road-camera wide-road-camera --camera-info
+  --topics narrow-road-camera wide-road-camera ground-link --camera-info
 ```
 
 `--topics` is required. Unselected fields and original event envelopes are not
@@ -42,21 +43,87 @@ cache are reused. Reduced qlogs are not substituted for rlogs.
 |---|---|---|
 | `narrow-road-camera`, `wide-road-camera`, `cabin-camera` | `sensor_msgs/msg/CompressedImage` | `/camera/<name>/image_raw/compressed` |
 | `gps-fix` | `sensor_msgs/msg/NavSatFix` | `/gps/fix` |
-| `gps-velocity` | `geometry_msgs/msg/Vector3Stamped` | `/gps/velocity` |
+| `gps-velocity` | `geometry_msgs/msg/Vector3Stamped` | `/gps/velocity`: east/north/up velocity vector |
+| `gps-speed` | `std_msgs/msg/Float64` | `/gps/speed`: magnitude of that vector, m/s |
 | `raw-acceleration`, `raw-angular-velocity` | `sensor_msgs/msg/Imu` | `/imu/acceleration`, `/imu/angular_velocity` |
 | `temperature` | `sensor_msgs/msg/Temperature` | `/imu/temperature` |
 | `estimated-imu` | `sensor_msgs/msg/Imu` | `/motion/imu` |
 | `device-velocity`, `camera-velocity` | `geometry_msgs/msg/TwistWithCovarianceStamped` | `/motion/velocity`, `/motion/camera_velocity` |
-| `vehicle-speed`, `steering-angle`, `steering-torque`, `vehicle-yaw-rate` | `std_msgs/msg/Float64` | `/vehicle/speed`, `/vehicle/steering_angle`, `/vehicle/steering_torque`, `/vehicle/yaw_rate` |
-| `autonomy-flags` | `std_msgs/msg/Bool` | `/autonomy/enabled`, `/autonomy/active`, `/autonomy/engageable` |
 | `predicted-path` | `nav_msgs/msg/Path` | `/model/path` |
 | `lane-lines`, `road-edges` | `nav_msgs/msg/Path` | Four `/model/lane_lines/line_<index>` and two `/model/road_edges/edge_<index>` topics |
 | `lead-vehicles` | `visualization_msgs/msg/MarkerArray` | `/model/leads`: current model lead ground indicator and distance label |
-| `target-acceleration` | `std_msgs/msg/Float64` | `/planning/target_acceleration` |
+| `ground-link` | `tf2_msgs/msg/TFMessage` | `/tf`: `ground_link` → `device_flu` → `model_flu` from the logged extrinsic calibration |
+
+Vehicle (CAN) state such as speed, steering, and yaw rate, openpilot's
+engagement flags, and longitudinal planning are intentionally not exported; the
+converter targets the device's own sensors and camera-derived outputs.
+`lead-vehicles` is kept deliberately: it is the camera model's detection of the
+vehicle ahead, not CAN data from the ego car. The extrinsic calibration behind
+`ground-link` and the camera transforms still depends on the car indirectly,
+because calibrationd only learns it while `carState` reports more than 15 mph
+(see [Ground link](#ground-link)).
 
 Two opt-in flags add camera calibration topics for the selected cameras:
 `--camera-info` (`sensor_msgs/msg/CameraInfo` on `/camera/<name>/camera_info`
-plus `/tf`) and `--camera-overlays`, described below.
+plus `/tf`) and `--camera-overlays`, described below. Their transforms share one
+`/tf` tree with `ground-link`.
+
+## Ground link
+
+Select `ground-link` to publish the logged extrinsic calibration as a road-level
+base frame aligned with the calibrated direction of travel, independent of any
+camera selection:
+
+- `ground_link` → `device_flu`: `ground_link` has the calibrated (model)
+  frame's axes in forward/left/up form, so x follows the calibrated direction of
+  travel. As in openpilot's calibrated frame, only pitch and yaw are calibrated
+  and roll follows the device, so z is normal to the road only if the device is
+  mounted level across the car. The origin is `height` below the device along
+  that z axis: the transform's translation is
+  `(0, 0, extrinsicsCalibration.height)`, and its rotation is the inverse of the
+  `rpyCalib` mounting rotation.
+- `device_flu` → `model_flu`: the same `rpyCalib` rotation that the camera flags
+  publish. `model_flu` shares the device's origin, so a model point at
+  (x, y, z) appears at (x, y, z + height) in `ground_link`. Lane lines and road
+  edges, which openpilot logs at road level, land near z = 0. `/model/path`,
+  logged at camera height, floats about `height` above it (see the path note
+  under Camera overlays).
+
+Transforms are published at every accepted `extrinsicsCalibration` update (about
+4 Hz) under the same calibrated-only rule as the camera transforms; add
+`--allow-uncalibrated-overlays` to also accept valid `uncalibrated` updates. The
+warning and `ground_frame` then mark `ground_link` as APPROXIMATE, since its
+rotation and height may not have converged. A selection that yields no transform fails, and a missing, non-finite, or
+non-positive `height` fails instead of being guessed. Accepted updates are
+recorded in the same `camera_calibration_policy`, `camera_calibration_counts`,
+and `camera_calibration_basis` metadata as the camera transforms, and
+`ground_frame` describes the frame. With `--camera-info` or `--camera-overlays`,
+the selected road optical frames are added to the same `/tf` messages, giving
+one tree rooted at `ground_link`; the cabin optical frame has no logged
+extrinsics and stays disconnected. In Foxglove's 3D panel, choose `ground_link` as the display
+frame. `ground_link` is body-fixed: it moves with the device, and no `odom` or
+`map` frame is exported.
+
+calibrationd only updates the calibration while `carState` reports more than
+15 mph driving straight; otherwise it keeps its startup values (the saved
+`CalibrationParams` from an earlier drive if present, else a zero rotation and
+1.22 m). A route without real car speed therefore carries one of three things:
+- a placeholder, on notCar routes (below);
+- no usable calibration, in which case `ground-link` fails unless
+  `--allow-uncalibrated-overlays` accepts the startup values;
+- on a device calibrated during an earlier drive, that drive's saved values,
+  reported as `calibrated` and exported by default (basis `calibrationd`). They
+  describe the earlier mounting.
+
+On notCar routes (see below), the rotation is the identity placeholder and the
+height usually keeps calibrationd's startup value (saved `CalibrationParams` if
+present, otherwise 1.22 m). The sample comma four route never met the speed
+condition (its `carState.vEgo` was 0), so every update carried 1.22 m. On that
+route, the model put the road
+1.23-1.34 m below the camera (per-segment medians of the inner lane lines 10 m
+ahead; camera odometry's road estimate gave 1.33-1.40 m). There, `ground_link`
+sits up to about 0.2 m above the model's road surface; lane lines 5-15 m ahead
+were a median 7 cm below it in the first two segments.
 
 ## Camera calibration info
 
@@ -71,11 +138,12 @@ stream**, including `cabin-camera`. Without it, camera topics are exported as be
   transforms from `device_flu` to `model_flu` and the selected road optical
   frames. These are the same transforms, under the same calibrated-only rule,
   that `--camera-overlays` adds (see below). Unlike overlay mode, a route without
-  usable calibration still exports its intrinsics, and a warning reports that
-  the optical frames are not connected to `device_flu`. Add
-  `--allow-uncalibrated-overlays` to also accept valid `uncalibrated` updates;
-  it requires a selected road camera. The cabin camera has no logged extrinsics
-  and stays disconnected.
+  usable calibration still exports its intrinsics (unless `ground-link` is also
+  selected, since it requires `/tf`), and a warning reports that the optical
+  frames are not connected to `device_flu`. Add `--allow-uncalibrated-overlays`
+  to also accept valid `uncalibrated` updates; it requires a selected road camera
+  or `ground-link`. The cabin camera has no logged extrinsics and stays
+  disconnected.
 
 **openpilot logs contain no lens calibration.** The only camera calibration in
 an rlog is extrinsic: `extrinsicsCalibration` (mounting rotation `rpyCalib`,
@@ -214,7 +282,7 @@ uv run python -m openpilot.tools.mcap.convert \
   --camera-overlays --allow-uncalibrated-overlays
 ```
 
-This requires `--camera-overlays` (or `--camera-info` with a selected road camera) and additionally accepts **valid events**
+This requires `--camera-overlays`, `--camera-info` with a selected road camera, or the `ground-link` signal, and additionally accepts **valid events**
 whose calibration status is `uncalibrated`. Invalid events and `invalid` or
 `recalibrating` statuses remain excluded. Missing, malformed, or nonfinite
 rotation vectors still fail; no zero-angle fallback or calibration from
@@ -223,8 +291,9 @@ another route is substituted.
 These overlays are **uncalibrated and approximate; alignment is not guaranteed**.
 An aggregate warning reports accepted uncalibrated updates. MCAP metadata marks
 `camera_calibration_policy=allow_uncalibrated`, prefixes `camera_projection`
-with `APPROXIMATE`, and records accepted status counts in
-`camera_calibration_counts`. Accepted uncalibrated updates are not mislabeled
+with `APPROXIMATE` when road-camera transforms are exported, appends an
+`APPROXIMATE` note to `ground_frame` when `ground-link` is selected, and records
+accepted status counts in `camera_calibration_counts`. Accepted uncalibrated updates are not mislabeled
 as skipped samples. Without this flag, calibrated-only behavior is unchanged.
 
 ### Lead indicators
@@ -254,6 +323,100 @@ indexes and optical frame IDs. Missing, duplicate, noncontiguous, or reordered
 indexes and decoded-frame-count mismatches fail explicitly. Cabin video is only
 available when its file was actually uploaded.
 
+## GNSS fix, velocity and speed
+
+All three GNSS groups read `gpsLocationExternal`, which `ubloxd` fills from the
+u-blox receiver's UBX-NAV-PVT solution, and share its log timestamp.
+
+- `/gps/fix` (`NavSatFix`, frame `gps`): WGS84 latitude, longitude and
+  ellipsoidal altitude; status `STATUS_FIX` (0) with `hasFix`, otherwise
+  `STATUS_NO_FIX` (-1). Constellation service stays unknown. The covariance is
+  described below.
+- `/gps/velocity` (`Vector3Stamped`, frame `gps_enu`): the receiver's `vNED`
+  velocity reordered to east, north, up (x = vE, y = vN, z = -vD), in m/s. It is
+  linear only, not a twist with made-up angular velocity.
+- `/gps/speed` (`Float64`, m/s): the magnitude of the same velocity,
+  sqrt(vN² + vE² + vD²), so it always equals the length of the `/gps/velocity`
+  vector. It includes the vertical component. The horizontal ground speed is
+  sqrt(x² + y²) of `/gps/velocity`; it agrees with u-blox's own `speed`
+  (gSpeed) field to about 1 mm/s. While moving, the two speeds are practically
+  equal: on route `0f0b77d795033efd/00000006--1dac2daf26` their medians were
+  10.283 and 10.281 m/s. When nearly stationary, vertical velocity noise makes
+  the 3D speed read higher. In that route's first three segments (speeds below
+  about 1 m/s), vD ranged from -0.07 to 0.11 m/s (5th to 95th percentile), and
+  the 3D speed exceeded the ground speed by a median of 0.02 m/s and at most
+  0.74 m/s. `std_msgs/Float64` has no header, so the sample's MCAP log time is
+  its timestamp. It is identical to the `/gps/velocity` header stamp.
+- Velocity and speed are published only for fixes (`hasFix`); other samples
+  are counted in `skipped_samples` as `gps-velocity: no GNSS fix` and
+  `gps-speed: no GNSS fix`. The receiver's speed and heading accuracies
+  (`speedAccuracy`, `bearingAccuracyDeg`) are not exported, because neither
+  message type has a field for them.
+
+### How the fix covariance is built
+
+`/gps/fix` `position_covariance` comes from the receiver's own accuracy
+estimates; the converter does not invent or tune any numbers:
+
+1. **Receiver.** Every UBX-NAV-PVT epoch, the u-blox navigation filter reports
+   its horizontal and vertical accuracy estimates, `hAcc` and `vAcc` in
+   millimetres, and a `gnssFixOK` flag.
+2. **openpilot.** `ubloxd` logs them in metres on `gpsLocationExternal`:
+   `horizontalAccuracy = hAcc × 0.001` and `verticalAccuracy = vAcc × 0.001`. It
+   sets `hasFix` from `gnssFixOK` and `source` to `ublox`.
+3. **Converter.** For a sample with `hasFix` and `source` `ublox`, take
+   σh = `horizontalAccuracy` and σv = `verticalAccuracy` as 1-sigma standard
+   deviations and write the row-major 3×3 matrix in m², in NavSatFix's east,
+   north, up order:
+
+   ```
+   position_covariance = [ σh²  0    0
+                           0    σh²  0
+                           0    0    σv² ]
+   position_covariance_type = COVARIANCE_TYPE_APPROXIMATED (1)
+   ```
+
+4. **Otherwise.** A sample without a fix, or from any other source, gets an
+   all-zero matrix with `COVARIANCE_TYPE_UNKNOWN` (0). A u-blox fix whose
+   accuracy is non-finite, zero or negative stops the export instead of being
+   written.
+
+Example from route `0f0b77d795033efd/00000006--1dac2daf26`: 9,675 fixes got
+`APPROXIMATED` and the 37 samples without a fix got `UNKNOWN`. The median
+σh = 0.935 m gives 0.874 m² on east and on north, and the median σv = 1.611 m
+gives 2.595 m² up. The 95th percentiles were 2.04 m and 3.92 m. The largest
+were 88 m and 61 m: degraded estimates pass through unchanged, not clipped.
+
+Why the type is `APPROXIMATED` and not `DIAGONAL_KNOWN`:
+
+- **Confidence level.** u-blox documents hAcc/vAcc only as "accuracy
+  estimates", without a confidence level. Like common u-blox ROS drivers, the
+  converter treats them as 1-sigma per axis. That is exact if hAcc is a
+  per-axis sigma, and conservative (about 2-2.3x too large in variance) if it
+  is a radial 68% or DRMS figure.
+- **One horizontal number.** hAcc has no east/north split or correlation, so
+  both horizontal axes get σh² and the cross terms are zero. Foxglove's Map
+  panel, which draws the 1-sigma ellipse, shows a circle of radius σh.
+- **Self-assessment.** The values are the receiver filter's own estimate, not a
+  verified error bound. In a 2D fix, vAcc describes the held altitude.
+
+Further limits:
+
+- Devices without a u-blox publish GNSS on `gpsLocation` (qcomgpsd, which
+  stores VDOP there, not metres), and `gps-fix` does not read it. Routes
+  recorded before `hasFix` existed (March 2024) also keep an unknown
+  covariance; `flags` is deliberately not used as a fallback, because simulator
+  logs set it with made-up accuracies.
+- Covariance is not adjusted for GNSS timing. The receiver's covariance applies
+  at its fix epoch, while headers carry the log time, which on sampled routes is
+  about 0.1 s later for fixes (per-segment medians 94-123 ms). At speed, the
+  resulting along-track error can exceed hAcc, so fusion users should account
+  for this latency.
+
+The MCAP records the method in the `openpilot` metadata record
+(`gps_fix_covariance`), and the number of fixes per covariance type in
+`gps_fix_covariance_counts`.
+
 ## Timestamps, frames, and units
 
 - All exported timestamps use Unix epoch nanoseconds (UTC), so viewers show
@@ -281,44 +444,16 @@ available when its file was actually uploaded.
   schema's "device frame" comment, so `/motion/camera_velocity` is exactly
   `device_flu` only while the logged `rpyCalib` is zero (for example on notCar
   routes). Otherwise it is rotated by the mounting calibration.
-- GNSS velocity is a linear-only ENU `Vector3Stamped`, not a twist containing
-  fabricated angular velocity. GNSS fixes preserve WGS84 latitude, longitude,
-  ellipsoidal altitude, and fix availability; constellation service stays unknown.
-- GNSS fix covariance: for u-blox fixes (`source` `ublox` with `hasFix`),
-  `position_covariance` is diag(hAcc², hAcc², vAcc²) in m² (east, north, up),
-  from the receiver's NAV-PVT accuracy estimates (`horizontalAccuracy`,
-  `verticalAccuracy`), with `COVARIANCE_TYPE_APPROXIMATED`. u-blox documents
-  these values only as accuracy estimates, without a confidence level. Like
-  common u-blox drivers, they are treated as 1-sigma per axis. That is exact if
-  hAcc is a per-axis sigma, and conservative (by about 2-2.3x in variance) if it
-  is a radial 68%/DRMS figure. hAcc has no east/north split or cross terms, so
-  both horizontal axes get hAcc², and Foxglove's Map panel (which draws the
-  1-sigma ellipse) shows a circle of radius hAcc. These
-  are the receiver filter's self-assessment, not verified error bounds. In a 2D
-  fix, vAcc describes the held altitude.
-- Samples without a fix keep zero covariance with `COVARIANCE_TYPE_UNKNOWN`, as
-  do fixes from any other `gpsLocationExternal` source. Devices without a u-blox
-  publish GNSS on `gpsLocation` (qcomgpsd, which stores VDOP there, not metres),
-  and `gps-fix` does not read it. Routes recorded before `hasFix` existed
-  (March 2024) also keep an unknown covariance; `flags` is deliberately not used
-  as a fallback, because simulator logs set it with made-up accuracies.
-- A u-blox fix with a non-finite or non-positive accuracy fails explicitly.
-  Speed and heading accuracies are not position uncertainties and are not
-  exported. `gps_fix_covariance_counts` metadata counts fixes per covariance type.
-- Covariance is not adjusted for GNSS timing. The receiver's covariance applies
-  at its fix epoch, while headers carry the log time, which on sampled routes is
-  about 0.1 s later for fixes (per-segment medians 94-123 ms). At speed, the
-  resulting along-track error can exceed hAcc, so fusion users should account
-  for this latency.
+- GNSS fix, velocity, speed and fix covariance conventions are described in
+  [GNSS fix, velocity and speed](#gnss-fix-velocity-and-speed).
 - Predicted paths, lane lines, and road edges use `model_flu`, with right/down
-  axes flipped. With `--camera-overlays` or `--camera-info`, logged calibration connects this
-  projection frame to `device_flu` and the road optical frames as described above.
+  axes flipped. With `ground-link`, or with `--camera-overlays`/`--camera-info` and a selected road camera, logged
+  calibration connects this projection frame to `device_flu`. `ground-link` adds `ground_link` as the root (the
+  parent of `device_flu`, `height` below it), and the camera flags add the selected road optical frames, as
+  described above.
   Path poses have identity orientation: they represent **position geometry**,
   not measured attitude. Predicted-position pose stamps include the source's
   future time offsets; lane/edge geometry retains its capture time.
-- Vehicle speed and target acceleration retain m/s and m/s^2. Steering-wheel
-  angles are converted from degrees to radians. Yaw rate stays as logged in
-  rad/s. **Steering torque retains vehicle-specific native CAN units, not Nm.**
 - Invalid source events, no-fix GNSS velocities, and unavailable device-velocity
   estimates are omitted with an explicit aggregate warning and `skipped_samples`
   MCAP metadata. Invalid individual estimated-IMU components are marked
@@ -345,6 +480,11 @@ decoding, current-versus-future lead semantics, and stale-marker removal.
 Camera-info tests check per-camera intrinsics (including the cabin camera),
 header synchronization across segments, both camera flags together, no
 calibration outputs in default exports and no cabin CameraInfo in overlay-only
-exports, missing hardware, and notCar placeholder labeling. GNSS tests check the u-blox covariance mapping,
-unknown covariance without a fix or for other sources, and rejected malformed
-accuracies.
+exports, missing hardware, and notCar placeholder labeling. Ground-link tests
+check that a road point in openpilot's calibrated frame lands on the
+`ground_link` plane, that the transform shares a tree with the camera frames,
+and that missing heights or calibrations fail. GNSS tests check the u-blox covariance mapping,
+unknown covariance without a fix or for other sources, rejected malformed
+accuracies, and that `/gps/speed` equals the decoded `/gps/velocity` magnitude
+with the same timestamp and is skipped without a fix. Tests also pin the exact set of exported signal groups, so no
+vehicle (CAN) state, engagement, or planning signal is exported.

@@ -41,6 +41,14 @@ def event(name: str, timestamp: int = 1_000_000_000, *, valid: bool = True):
   return message
 
 
+def temperature_event(timestamp: int, temperature: float = 25.0, *, valid: bool = True):
+  # A minimal sensor sample for tests that only need some exported signal.
+  message = event("temperatureSensor", timestamp, valid=valid)
+  message.temperatureSensor.timestamp = timestamp
+  message.temperatureSensor.temperature = temperature
+  return message
+
+
 def encode_event(frame: int, timestamp: int, segment: int = 0, name: str = "narrowRoadEncodeIdx"):
   message = event(name, timestamp + 100)
   index = getattr(message, name)
@@ -110,6 +118,44 @@ class TestCameraProjection(unittest.TestCase):
     np.testing.assert_allclose(info.p.reshape(3, 4), np.column_stack((config.intrinsics, np.zeros(3))))
     np.testing.assert_array_equal(info.r, np.eye(3).ravel())
     np.testing.assert_array_equal(info.d, np.zeros(5))
+
+  def test_ground_link_places_the_device_above_the_calibrated_road_plane(self):
+    calibration = calibration_event().extrinsicsCalibration  # rpyCalib [0.03, -0.05, 0.08], height [1.5]
+    result = camera_transforms(calibration, 1_000, ["narrow_road_optical"], ground=True)
+    by_child = {transform.child_frame_id: transform for transform in result.transforms}
+    self.assertEqual(set(by_child), {"device_flu", "model_flu", "narrow_road_optical"})
+    ground = by_child["device_flu"]
+    self.assertEqual(ground.header.frame_id, "ground_link")
+    self.assertEqual(ground.header.stamp.nanosec, 1_000)
+    translation = ground.transform.translation
+    self.assertEqual((translation.x, translation.y, translation.z), (0.0, 0.0, 1.5))
+
+    def rotation(transform) -> np.ndarray:
+      q = transform.transform.rotation
+      quaternion = np.array([q.w, q.x, q.y, q.z])
+      self.assertAlmostEqual(float(np.linalg.norm(quaternion)), 1.0)
+      return rotations_from_quats(quaternion)
+
+    ground_from_device = rotation(ground)
+    # ground_link shares model_flu's axes: composing ground<-device<-model is the identity rotation.
+    np.testing.assert_allclose(ground_from_device @ rotation(by_child["model_flu"]), np.eye(3), atol=1e-12)
+    # A road point 12 m ahead and 1 m right in openpilot's calibrated frame (z down, at the calibrated camera height) lies on
+    # the ground_link plane, with forward/left preserved.
+    road_point_device = DEVICE_TO_FLU @ rot_from_euler(calibration.rpyCalib) @ np.array([12.0, 1.0, 1.5])
+    np.testing.assert_allclose(ground_from_device @ road_point_device + np.array([0.0, 0.0, 1.5]), [12.0, -1.0, 0.0], atol=1e-12)
+    # Without ground_link the camera transforms are unchanged.
+    plain = camera_transforms(calibration, 1_000, ["narrow_road_optical"])
+    self.assertEqual([(t.header.frame_id, t.child_frame_id) for t in plain.transforms], [("device_flu", "model_flu"), ("device_flu", "narrow_road_optical")])
+
+  def test_ground_link_requires_one_finite_positive_height(self):
+    calibration = calibration_event().extrinsicsCalibration
+    for height in ([], [1.2, 1.3], [float("nan")], [float("inf")], [0.0], [-1.0]):
+      with self.subTest(height=height):
+        calibration.height = height
+        with self.assertRaisesRegex(ValueError, "height"):
+          camera_transforms(calibration, 100, [], ground=True)
+        # Camera transforms alone never needed the height.
+        self.assertEqual(len(camera_transforms(calibration, 100, ["narrow_road_optical"]).transforms), 2)
 
   def test_missing_or_nonfinite_calibration_is_not_invented(self):
     calibration = calibration_event().extrinsicsCalibration
@@ -199,6 +245,22 @@ class TestMappings(unittest.TestCase):
       for topic in signal.topics:
         self.assertRegex(topic, r"^/[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*$")
 
+  def test_exported_signal_set_is_pinned(self):
+    # Changing what can be exported (for example re-adding vehicle topics) must be a deliberate edit of this list.
+    self.assertEqual(set(SIGNALS), {
+      "narrow-road-camera", "wide-road-camera", "cabin-camera", "gps-fix", "gps-velocity", "gps-speed", "raw-acceleration", "raw-angular-velocity",
+      "temperature", "estimated-imu", "device-velocity", "camera-velocity", "predicted-path", "lane-lines", "road-edges", "lead-vehicles",
+      "ground-link",
+    })
+
+  def test_vehicle_and_control_signals_are_not_exported(self):
+    for name in ("vehicle-speed", "steering-angle", "steering-torque", "vehicle-yaw-rate", "autonomy-flags", "target-acceleration"):
+      self.assertNotIn(name, SIGNALS)
+    for signal in SIGNALS.values():
+      self.assertNotIn(signal.source, {"carState", "carControl", "carOutput", "selfdriveState", "longitudinalPlan"})
+      for topic in signal.topics:
+        self.assertFalse(topic.startswith(("/vehicle/", "/autonomy/", "/planning/")), topic)
+
   def test_raw_imu_axes_and_unknown_components(self):
     message = event("accelerometer")
     data = message.accelerometer
@@ -239,11 +301,16 @@ class TestMappings(unittest.TestCase):
     velocity = self.mapped("gps-velocity", message)[0][2]
     self.assertEqual(velocity.__msgtype__, "geometry_msgs/msg/Vector3Stamped")
     self.assertEqual((velocity.vector.x, velocity.vector.y, velocity.vector.z), (2.0, 1.0, -3.0))
+    _, topic, speed = self.mapped("gps-speed", message)[0]
+    self.assertEqual((topic, speed.__msgtype__), ("/gps/speed", "std_msgs/msg/Float64"))
+    self.assertAlmostEqual(speed.data, math.sqrt(14.0))
+    self.assertEqual(speed.data, math.hypot(velocity.vector.x, velocity.vector.y, velocity.vector.z))
     data.hasFix = False
     self.assertEqual(self.mapped("gps-fix", message)[0][2].status.status, -1)
     skipped = Counter()
-    self.assertEqual(list(signal_messages("gps-velocity", data, message.logMonoTime, skipped)), [])
-    self.assertEqual(skipped["gps-velocity: no GNSS fix"], 1)
+    for signal in ("gps-velocity", "gps-speed"):
+      self.assertEqual(list(signal_messages(signal, data, message.logMonoTime, skipped)), [])
+    self.assertEqual(skipped, {"gps-velocity: no GNSS fix": 1, "gps-speed: no GNSS fix": 1})
 
   def gps_message(self, *, source: str = "ublox", has_fix: bool = True, horizontal: float = 1.5, vertical: float = 2.5):
     message = event("gpsLocationExternal")
@@ -328,21 +395,6 @@ class TestMappings(unittest.TestCase):
     self.assertEqual(result.twist.twist.angular.z, -6)
     np.testing.assert_array_equal(np.diag(result.twist.covariance.reshape(6, 6)), [1, 4, 9, 16, 25, 36])
 
-  def test_vehicle_values_and_autonomy_flags(self):
-    message = event("carState")
-    message.carState.vEgo = 12.0
-    message.carState.steeringAngleDeg = 90.0
-    message.carState.steeringTorque = 123.0
-    message.carState.yawRate = 0.5
-    for signal, value in (("vehicle-speed", 12.0), ("steering-angle", math.pi / 2), ("steering-torque", 123.0), ("vehicle-yaw-rate", 0.5)):
-      self.assertAlmostEqual(self.mapped(signal, message)[0][2].data, value)
-    autonomy = event("selfdriveState")
-    autonomy.selfdriveState.enabled = True
-    self.assertEqual([result.data for _, _, result in self.mapped("autonomy-flags", autonomy)], [True, False, False])
-    plan = event("longitudinalPlan")
-    plan.longitudinalPlan.aTarget = -2.0
-    self.assertEqual(self.mapped("target-acceleration", plan)[0][2].data, -2.0)
-
   def test_paths_and_future_timestamps(self):
     message = event("modelV2")
     model = message.modelV2
@@ -416,10 +468,10 @@ class TestMappings(unittest.TestCase):
       lead_markers(model, 100, Counter())
 
   def test_invalid_event_is_counted_not_exported(self):
-    message = event("carState", valid=False)
+    message = temperature_event(1_000, valid=False)
     skipped = Counter()
-    self.assertEqual(list(log_messages([message], {"vehicle-speed"}, skipped)), [])
-    self.assertEqual(skipped["vehicle-speed: invalid source event"], 1)
+    self.assertEqual(list(log_messages([message], {"temperature"}, skipped)), [])
+    self.assertEqual(skipped["temperature: invalid source event"], 1)
 
   def test_invalid_inputs_fail(self):
     with self.assertRaises(ValueError):
@@ -441,8 +493,7 @@ class TestConversion(unittest.TestCase):
     self.addCleanup(self.directory.cleanup)
     self.root = Path(self.directory.name)
     self.output = self.root / "route.mcap"
-    first, second = event("carState", 200), event("carState", 100)
-    first.carState.vEgo, second.carState.vEgo = 2.0, 1.0
+    first, second = temperature_event(200, 2.0), temperature_event(100, 1.0)
     self.segment = self.make_segment(0, [first, second])
     route_patch = patch(f"{MODULE}.Route")
     self.route = route_patch.start().return_value
@@ -624,7 +675,7 @@ class TestConversion(unittest.TestCase):
 
   def test_uncalibrated_opt_in_requires_camera_overlays(self):
     with self.assertRaisesRegex(ValueError, "requires --camera-overlays"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"], allow_uncalibrated_overlays=True)
+      convert_route(ROUTE, self.output, topics=["temperature"], allow_uncalibrated_overlays=True)
 
   def test_overlay_resolution_mismatch_fails_atomically(self):
     self.make_overlay_segment()
@@ -634,7 +685,7 @@ class TestConversion(unittest.TestCase):
 
   def test_overlay_requires_a_road_camera(self):
     with self.assertRaisesRegex(ValueError, "selected road camera"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"], camera_overlays=True)
+      convert_route(ROUTE, self.output, topics=["temperature"], camera_overlays=True)
 
   def test_unavailable_calibration_is_reported(self):
     self.make_overlay_segment()
@@ -799,10 +850,11 @@ class TestConversion(unittest.TestCase):
     self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "disabled")
     for name in ("camera_intrinsics", "camera_calibration_counts", "camera_calibration_basis", "gps_fix_covariance_counts"):
       self.assertNotIn(name, metadata)
+    self.assertNotIn("ground_frame", metadata["openpilot"])
 
   def test_camera_info_requires_a_selected_camera(self):
     with self.assertRaisesRegex(ValueError, "--camera-info requires at least one selected camera"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"], camera_info=True)
+      convert_route(ROUTE, self.output, topics=["temperature"], camera_info=True)
     self.assertFalse(self.output.exists())
 
   def test_cabin_only_camera_info_has_no_extrinsics(self):
@@ -923,6 +975,107 @@ class TestConversion(unittest.TestCase):
         self.assertEqual(metadata["camera_calibration_counts"], {"calibrated": "1"})
         self.assertEqual(metadata["camera_calibration_basis"], {basis: "1"})
         self.assertEqual(sum("PLACEHOLDER" in call.args[0] for call in warning.call_args_list), placeholder_warnings)
+        # ground_link wording only appears when ground-link is selected.
+        self.assertFalse(any("ground_link" in call.args[0] for call in warning.call_args_list))
+
+  def test_ground_link_alone_exports_the_extrinsic_calibration(self):
+    self.make_camera_segment((), not_car=True)
+    with patch(f"{MODULE}.cloudlog.warning") as warning:
+      counts = convert_route(ROUTE, self.output, topics=["ground-link"])
+    self.assertEqual(counts, {"/tf": 1})
+    messages, _, metadata = self.read_messages()
+    transforms = messages[0][2].transforms
+    self.assertEqual(sorted((t.header.frame_id, t.child_frame_id) for t in transforms), [("device_flu", "model_flu"), ("ground_link", "device_flu")])
+    ground = next(t for t in transforms if t.header.frame_id == "ground_link")
+    self.assertEqual(ground.transform.translation.z, 1.5)
+    self.assertEqual(ground.header.stamp.sec * 1_000_000_000 + ground.header.stamp.nanosec, TIME_OFFSET + 90)
+    self.assertIn("ground_link", metadata["openpilot"]["ground_frame"])
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "calibrated_only")
+    self.assertEqual(metadata["camera_calibration_basis"], {"notcar_placeholder": "1"})
+    self.assertNotIn("camera_intrinsics", metadata)
+    self.assertTrue(any("PLACEHOLDER" in call.args[0] and "ground_link" in call.args[0] for call in warning.call_args_list))
+
+  def test_ground_link_and_camera_calibration_share_one_tf_tree(self):
+    self.make_camera_segment(("narrowRoad",))
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "ground-link"], camera_info=True)
+    self.assertEqual(counts["/tf"], 1)
+    messages, _, metadata = self.read_messages()
+    transforms = next(message for channel, _, message in messages if channel.topic == "/tf").transforms
+    self.assertEqual(
+      sorted((t.header.frame_id, t.child_frame_id) for t in transforms),
+      [("device_flu", "model_flu"), ("device_flu", "narrow_road_optical"), ("ground_link", "device_flu")],
+    )
+    self.assertEqual(metadata["camera_calibration_counts"], {"calibrated": "1"})
+
+  def test_ground_link_needs_usable_calibration(self):
+    self.make_camera_segment((), with_calibration=False)
+    uncalibrated = calibration_event()
+    uncalibrated.extrinsicsCalibration.calStatus = "uncalibrated"
+    with (self.root / "rlog0").open("ab") as stream:
+      stream.write(uncalibrated.to_bytes())
+    with patch(f"{MODULE}.cloudlog.warning") as warning, self.assertRaisesRegex(ValueError, r"produced no available samples: \['/tf'\]"):
+      convert_route(ROUTE, self.output, topics=["ground-link"])
+    self.assertFalse(self.output.exists())
+    self.assertIn("ground-link: unavailable calibration", warning.call_args_list[0].args[0])
+    # The explicit uncalibrated opt-in also applies to ground_link on its own, and is reported as such.
+    with patch(f"{MODULE}.cloudlog.warning") as warning:
+      counts = convert_route(ROUTE, self.output, topics=["ground-link"], allow_uncalibrated_overlays=True)
+    self.assertEqual(counts, {"/tf": 1})
+    approximate = [call.args[0] for call in warning.call_args_list if "APPROXIMATE" in call.args[0]]
+    self.assertEqual(len(approximate), 1)
+    self.assertIn("APPROXIMATE ground_link", approximate[0])
+    self.assertIn("may not have converged", approximate[0])
+    self.assertNotIn("camera", approximate[0])
+    _, _, metadata = self.read_messages()
+    self.assertEqual(metadata["openpilot"]["camera_calibration_policy"], "allow_uncalibrated")
+    self.assertEqual(metadata["camera_calibration_counts"], {"uncalibrated": "1"})
+    self.assertIn("APPROXIMATE", metadata["openpilot"]["ground_frame"])
+    self.assertNotIn("APPROXIMATE", metadata["openpilot"]["camera_projection"])
+
+  def test_ground_link_failures_name_their_cause_once(self):
+    self.make_camera_segment(("narrowRoad",), with_calibration=False)
+    uncalibrated = calibration_event()
+    uncalibrated.extrinsicsCalibration.calStatus = "uncalibrated"
+    with (self.root / "rlog0").open("ab") as stream:
+      stream.write(uncalibrated.to_bytes())
+    topics = ["narrow-road-camera", "ground-link"]
+    with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+      # Overlays and ground-link both require /tf; the error lists it once.
+      with patch(f"{MODULE}.cloudlog.warning"), self.assertRaisesRegex(ValueError, r"no available samples: \['/tf'\]$"):
+        convert_route(ROUTE, self.output, topics=topics, camera_overlays=True)
+      # With best-effort --camera-info, ground-link is what makes /tf mandatory, so skipped updates are attributed to it.
+      with patch(f"{MODULE}.cloudlog.warning") as warning, self.assertRaisesRegex(ValueError, r"\['/tf'\]"):
+        convert_route(ROUTE, self.output, topics=topics, camera_info=True)
+    self.assertIn("'ground-link: unavailable calibration': 1", warning.call_args_list[0].args[0])
+    self.assertFalse(self.output.exists())
+
+  def test_ground_link_invalid_height_fails_atomically(self):
+    self.make_camera_segment((), with_calibration=False)
+    bad = calibration_event(95)
+    bad.extrinsicsCalibration.height = []
+    with (self.root / "rlog0").open("ab") as stream:
+      stream.write(calibration_event(90).to_bytes() + bad.to_bytes())
+    with self.assertRaisesRegex(ValueError, "height"):
+      convert_route(ROUTE, self.output, topics=["ground-link"])
+    self.assertFalse(self.output.exists())
+
+  def test_ground_link_camera_frames_follow_the_camera_flags(self):
+    self.make_camera_segment(("narrowRoad",))
+    topics = ["narrow-road-camera", "ground-link"]
+    cases = (
+      ({}, [("device_flu", "model_flu"), ("ground_link", "device_flu")]),
+      ({"camera_overlays": True}, [("device_flu", "model_flu"), ("device_flu", "narrow_road_optical"), ("ground_link", "device_flu")]),
+    )
+    for options, edges in cases:
+      with self.subTest(options=options):
+        self.output.unlink(missing_ok=True)
+        with patch.dict(f"{MODULE}.DEVICE_CAMERAS", {("mici", "os04c10"): INFO_CAMERA_CONFIG}):
+          counts = convert_route(ROUTE, self.output, topics=topics, **options)
+        self.assertEqual("/camera/narrowRoad/camera_info" in counts, bool(options))
+        messages, _, _ = self.read_messages()
+        transforms = next(message for channel, _, message in messages if channel.topic == "/tf").transforms
+        self.assertEqual(sorted((t.header.frame_id, t.child_frame_id) for t in transforms), edges)
 
   def test_gps_fix_covariance_round_trip_and_counts(self):
     fixed, unfixed = event("gpsLocationExternal", 100), event("gpsLocationExternal", 200)
@@ -939,17 +1092,39 @@ class TestConversion(unittest.TestCase):
     )
     self.assertEqual(metadata["gps_fix_covariance_counts"], {"approximated": "1", "unknown": "1"})
     self.assertIn("diag(hAcc^2, hAcc^2, vAcc^2)", metadata["openpilot"]["gps_fix_covariance"])
+    self.assertIn("gpsLocationExternal.horizontalAccuracy/verticalAccuracy", metadata["openpilot"]["gps_fix_covariance"])
+
+  def test_gps_speed_round_trip_matches_velocity_magnitude(self):
+    fixed, unfixed = event("gpsLocationExternal", 100), event("gpsLocationExternal", 200)
+    fixed.gpsLocationExternal.hasFix = True
+    fixed.gpsLocationExternal.vNED = [3.0, -4.0, 12.0]
+    unfixed.gpsLocationExternal.vNED = [1.0, 1.0, 1.0]
+    self.route.segments = [self.make_segment(0, [fixed, unfixed])]
+    counts = convert_route(ROUTE, self.output, topics=["gps-velocity", "gps-speed"])
+    self.assertEqual(counts, {"/gps/velocity": 1, "/gps/speed": 1})
+    messages, _, metadata = self.read_messages()
+    by_topic = {channel.topic: (record, message) for channel, record, message in messages}
+    (speed_record, speed), (velocity_record, velocity) = by_topic["/gps/speed"], by_topic["/gps/velocity"]
+    self.assertEqual(speed.__msgtype__, "std_msgs/msg/Float64")
+    self.assertEqual(speed.data, 13.0)
+    self.assertEqual(speed.data, math.hypot(velocity.vector.x, velocity.vector.y, velocity.vector.z))
+    stamp = velocity.header.stamp
+    self.assertEqual(speed_record.log_time, velocity_record.log_time)
+    self.assertEqual(speed_record.log_time, stamp.sec * 1_000_000_000 + stamp.nanosec)
+    self.assertEqual(speed_record.log_time, TIME_OFFSET + 100)
+    self.assertEqual(metadata["skipped_samples"], {"gps-speed: no GNSS fix": "1", "gps-velocity: no GNSS fix": "1"})
+    self.assertIn("magnitude of the 3D vNED velocity", metadata["openpilot"]["gps_speed"])
 
   def test_native_cdr_round_trip_and_filtering(self):
-    counts = convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+    counts = convert_route(ROUTE, self.output, topics=["temperature"])
     messages, summary, metadata = self.read_messages()
-    self.assertEqual(counts, {"/vehicle/speed": 2})
+    self.assertEqual(counts, {"/imu/temperature": 2})
     self.assertEqual([record.log_time for _, record, _ in messages], [TIME_OFFSET + 100, TIME_OFFSET + 200])
     self.assertEqual([record.publish_time for _, record, _ in messages], [TIME_OFFSET + 100, TIME_OFFSET + 200])
-    self.assertEqual([message.data for _, _, message in messages], [1.0, 2.0])
+    self.assertEqual([message.temperature for _, _, message in messages], [1.0, 2.0])
     self.assertEqual([record.sequence for _, record, _ in messages], [0, 1])
     self.assertEqual(summary.statistics.message_count, 2)
-    self.assertEqual(metadata["openpilot"]["selected_signals"], "vehicle-speed")
+    self.assertEqual(metadata["openpilot"]["selected_signals"], "temperature")
     self.assertEqual(metadata["openpilot"]["time_basis"], "Unix epoch nanoseconds (UTC)")
     self.assertEqual(metadata["openpilot"]["time_offset_ns"], str(TIME_OFFSET))
     self.assertEqual(metadata["openpilot"]["time_anchor"], "clocks.wallTimeNanos")
@@ -959,16 +1134,16 @@ class TestConversion(unittest.TestCase):
       self.assertTrue(record.data.startswith(b"\x00\x01\x00\x00"))
 
   def test_multiple_segments_and_range(self):
-    self.route.segments.append(self.make_segment(1, [event("carState", 300)]))
+    self.route.segments.append(self.make_segment(1, [temperature_event(300)]))
     self.route.max_seg_number = 1
-    counts = convert_route(f"{ROUTE}/1", self.output, topics=["vehicle-speed"])
+    counts = convert_route(f"{ROUTE}/1", self.output, topics=["temperature"])
     messages, _, metadata = self.read_messages()
-    self.assertEqual(counts, {"/vehicle/speed": 1})
+    self.assertEqual(counts, {"/imu/temperature": 1})
     self.assertEqual(messages[0][1].log_time, TIME_OFFSET + 300)
     self.assertEqual(metadata["openpilot"]["segments"], "1")
 
   def test_full_route_with_two_selected_cameras(self):
-    second = self.make_segment(1, [event("carState", 300)])
+    second = self.make_segment(1, [temperature_event(300)])
     self.route.segments.append(second)
     self.route.max_seg_number = 1
     for segment in self.route.segments:
@@ -986,7 +1161,7 @@ class TestConversion(unittest.TestCase):
         )
 
     with patch(f"{MODULE}.video_messages", side_effect=video):
-      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "wide-road-camera", "vehicle-speed"])
+      counts = convert_route(ROUTE, self.output, topics=["narrow-road-camera", "wide-road-camera", "temperature"])
     messages, summary, metadata = self.read_messages()
     self.assertEqual(summary.statistics.message_count, 11)
     self.assertEqual(metadata["openpilot"]["segments"], "0,1")
@@ -1000,8 +1175,8 @@ class TestConversion(unittest.TestCase):
   def test_unselected_camera_is_not_read(self):
     self.segment.camera_path = "unselected-video"
     with patch(f"{MODULE}.FileReader", side_effect=AssertionError("Unselected camera was read")):
-      counts = convert_route(ROUTE, self.output, topics=["vehicle-speed"])
-    self.assertEqual(counts, {"/vehicle/speed": 2})
+      counts = convert_route(ROUTE, self.output, topics=["temperature"])
+    self.assertEqual(counts, {"/imu/temperature": 2})
 
   def test_missing_selected_source_fails_atomically(self):
     with self.assertRaisesRegex(ValueError, "produced no available"):
@@ -1009,22 +1184,22 @@ class TestConversion(unittest.TestCase):
     self.assertFalse(self.output.exists())
 
   def test_bad_selection(self):
-    for topics in ([], ["not-a-signal"]):
+    for topics in ([], ["not-a-signal"], ["vehicle-speed"]):
       with self.subTest(topics=topics), self.assertRaisesRegex(ValueError, "supported signal"):
         convert_route(ROUTE, self.output, topics=topics)
 
   def test_source_inventory_reports_validity(self):
-    self.route.segments = [self.make_segment(0, [event("carState", 100), event("carState", 200, valid=False)])]
+    self.route.segments = [self.make_segment(0, [temperature_event(100), temperature_event(200, valid=False)])]
     output = io.StringIO()
     with patch("sys.argv", ["convert", ROUTE, "--list-sources"]), redirect_stdout(output):
       main()
-    self.assertIn("carState: 2 total, 1 valid", output.getvalue())
+    self.assertIn("temperatureSensor: 2 total, 1 valid", output.getvalue())
     self.assertFalse(self.output.exists())
 
   def test_existing_output_is_untouched(self):
     self.output.write_bytes(b"existing")
     with self.assertRaises(FileExistsError):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
     self.assertEqual(self.output.read_bytes(), b"existing")
 
   def test_missing_inputs(self):
@@ -1032,21 +1207,21 @@ class TestConversion(unittest.TestCase):
       convert_route(ROUTE, self.output, topics=["narrow-road-camera"])
     self.segment.log_path = None
     with self.assertRaisesRegex(ValueError, "no rlog"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
 
   def test_missing_segment_and_invalid_selector(self):
     self.route.max_seg_number = 1
     with self.assertRaisesRegex(ValueError, "missing segments"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
     with self.assertRaisesRegex(ValueError, "requires rlogs"):
-      convert_route(f"{ROUTE}/0/q", self.output, topics=["vehicle-speed"])
+      convert_route(f"{ROUTE}/0/q", self.output, topics=["temperature"])
     with self.assertRaisesRegex(ValueError, "No segments"):
-      convert_route(f"{ROUTE}/0:0", self.output, topics=["vehicle-speed"])
+      convert_route(f"{ROUTE}/0:0", self.output, topics=["temperature"])
 
   def test_failure_does_not_leave_partial_export(self):
     before = set(self.root.iterdir())
     with patch(f"{MODULE}.LogReader", side_effect=OSError("download failed")), self.assertRaisesRegex(OSError, "download failed"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
     self.assertEqual(set(self.root.iterdir()), before)
 
   def test_corrupt_logs_are_not_silently_truncated(self):
@@ -1055,18 +1230,18 @@ class TestConversion(unittest.TestCase):
       return []
 
     with patch(f"{MODULE}.LogReader", side_effect=corrupt_log), self.assertRaisesRegex(RuntimeWarning, "Corrupted events"):
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
     self.assertFalse(self.output.exists())
 
   def test_unavailable_samples_are_reported(self):
-    valid = event("carState", 200)
-    invalid = event("carState", 100, valid=False)
+    valid = temperature_event(200)
+    invalid = temperature_event(100, valid=False)
     self.route.segments = [self.make_segment(0, [invalid, valid])]
     with patch(f"{MODULE}.cloudlog.warning") as warning:
-      convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+      convert_route(ROUTE, self.output, topics=["temperature"])
     self.assertEqual(warning.call_count, 1)
     _, _, metadata = self.read_messages()
-    self.assertEqual(metadata["skipped_samples"]["vehicle-speed: invalid source event"], "1")
+    self.assertEqual(metadata["skipped_samples"]["temperature: invalid source event"], "1")
 
   def test_utc_headers_preserve_acquisition_and_future_timestamps(self):
     acceleration = event("accelerometer", 2_000_000_000)
@@ -1107,6 +1282,7 @@ class TestConversion(unittest.TestCase):
       "road-edges": (model, 2_400_000_000),
       "gps-fix": (gps, gps.logMonoTime),
       "gps-velocity": (gps, gps.logMonoTime),
+      "gps-speed": (gps, gps.logMonoTime),
     }
     convert_route(ROUTE, self.output, topics=samples.keys())
     messages, _, _ = self.read_messages()
@@ -1116,6 +1292,8 @@ class TestConversion(unittest.TestCase):
       source, timestamp = by_topic[channel.topic]
       self.assertEqual(record.log_time, TIME_OFFSET + source.logMonoTime)
       self.assertEqual(record.publish_time, record.log_time)
+      if message.__msgtype__ == "std_msgs/msg/Float64":
+        continue  # No header: the log time checked above is its only timestamp.
       self.assertEqual(message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec, TIME_OFFSET + timestamp)
       if message.__msgtype__ == "nav_msgs/msg/Path":
         for i, pose in enumerate(message.poses):
@@ -1125,8 +1303,8 @@ class TestConversion(unittest.TestCase):
   def test_clock_anchor_takes_precedence_over_init_data(self):
     init = event("initData", 50)
     init.initData.wallTimeNanos = UTC_TIME - 1_000_000_000
-    self.route.segments = [self.make_segment(0, [init, event("carState", 100)])]
-    convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+    self.route.segments = [self.make_segment(0, [init, temperature_event(100)])]
+    convert_route(ROUTE, self.output, topics=["temperature"])
     messages, _, metadata = self.read_messages()
     self.assertEqual(messages[0][1].log_time, TIME_OFFSET + 100)
     self.assertEqual(metadata["openpilot"]["time_anchor"], "clocks.wallTimeNanos")
@@ -1136,8 +1314,8 @@ class TestConversion(unittest.TestCase):
     init.initData.wallTimeNanos = UTC_TIME
     clock = event("clocks", 75, valid=False)
     clock.clocks.wallTimeNanos = UTC_TIME + 1_000_000_000
-    self.route.segments = [self.make_segment(0, [init, clock, event("carState", 100)], with_clock=False)]
-    convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+    self.route.segments = [self.make_segment(0, [init, clock, temperature_event(100)], with_clock=False)]
+    convert_route(ROUTE, self.output, topics=["temperature"])
     messages, _, metadata = self.read_messages()
     self.assertEqual(messages[0][1].log_time, TIME_OFFSET + 100)
     self.assertEqual(metadata["openpilot"]["time_anchor"], "initData.wallTimeNanos")
@@ -1147,18 +1325,18 @@ class TestConversion(unittest.TestCase):
     invalid.clocks.wallTimeNanos = UTC_TIME
     for anchors in ([], [invalid], [event("clocks", 50)], [event("initData", 50)]):
       with self.subTest(anchors=[anchor.which() for anchor in anchors]):
-        self.route.segments = [self.make_segment(0, [*anchors, event("carState", 100)], with_clock=False)]
+        self.route.segments = [self.make_segment(0, [*anchors, temperature_event(100)], with_clock=False)]
         before = set(self.root.iterdir())
         with self.assertRaisesRegex(ValueError, "UTC clock anchor"):
-          convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+          convert_route(ROUTE, self.output, topics=["temperature"])
         self.assertEqual(set(self.root.iterdir()), before)
 
   def test_later_clock_changes_preserve_monotonic_intervals(self):
     clock = event("clocks", 250)
     clock.clocks.wallTimeNanos = UTC_TIME + 10_000_000_000
-    self.route.segments.append(self.make_segment(1, [clock, event("carState", 300)], with_clock=False))
+    self.route.segments.append(self.make_segment(1, [clock, temperature_event(300)], with_clock=False))
     self.route.max_seg_number = 1
-    convert_route(ROUTE, self.output, topics=["vehicle-speed"])
+    convert_route(ROUTE, self.output, topics=["temperature"])
     messages, _, _ = self.read_messages()
     self.assertEqual([record.log_time for _, record, _ in messages], [TIME_OFFSET + timestamp for timestamp in (100, 200, 300)])
 

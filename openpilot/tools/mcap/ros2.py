@@ -27,7 +27,6 @@ from rosbags.typesys.stores.ros2_jazzy import (
   sensor_msgs__msg__NavSatFix as NavSatFix,
   sensor_msgs__msg__RegionOfInterest as RegionOfInterest,
   sensor_msgs__msg__Temperature as Temperature,
-  std_msgs__msg__Bool as Bool,
   std_msgs__msg__ColorRGBA as ColorRGBA,
   std_msgs__msg__Float64 as Float64,
   std_msgs__msg__Header as Header,
@@ -46,7 +45,7 @@ NED_TO_ENU = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
 
 Message = (
   CompressedImage | CameraInfo | TFMessage | Marker | MarkerArray | Imu | NavSatFix | Temperature |
-  Vector3Stamped | TwistWithCovarianceStamped | Float64 | Bool | PathMessage
+  Vector3Stamped | TwistWithCovarianceStamped | Float64 | PathMessage
 )
 TimedMessage = tuple[int, str, Message]
 
@@ -58,29 +57,30 @@ class Signal:
   topics: tuple[str, ...]
 
 
+# Vehicle (CAN) state, openpilot engagement, and longitudinal planning are intentionally not exported: the converter targets the
+# device's own sensors and camera-derived outputs.
 SIGNALS = {
   "narrow-road-camera": Signal("narrowRoadEncodeIdx", "sensor_msgs/msg/CompressedImage", ("/camera/narrowRoad/image_raw/compressed",)),
   "wide-road-camera": Signal("wideRoadEncodeIdx", "sensor_msgs/msg/CompressedImage", ("/camera/wideRoad/image_raw/compressed",)),
   "cabin-camera": Signal("cabinEncodeIdx", "sensor_msgs/msg/CompressedImage", ("/camera/cabin/image_raw/compressed",)),
   "gps-fix": Signal("gpsLocationExternal", "sensor_msgs/msg/NavSatFix", ("/gps/fix",)),
   "gps-velocity": Signal("gpsLocationExternal", "geometry_msgs/msg/Vector3Stamped", ("/gps/velocity",)),
+  "gps-speed": Signal("gpsLocationExternal", "std_msgs/msg/Float64", ("/gps/speed",)),
   "raw-acceleration": Signal("accelerometer", "sensor_msgs/msg/Imu", ("/imu/acceleration",)),
   "raw-angular-velocity": Signal("gyroscope", "sensor_msgs/msg/Imu", ("/imu/angular_velocity",)),
   "temperature": Signal("temperatureSensor", "sensor_msgs/msg/Temperature", ("/imu/temperature",)),
   "estimated-imu": Signal("deviceMotion", "sensor_msgs/msg/Imu", ("/motion/imu",)),
   "device-velocity": Signal("deviceMotion", "geometry_msgs/msg/TwistWithCovarianceStamped", ("/motion/velocity",)),
   "camera-velocity": Signal("cameraOdometry", "geometry_msgs/msg/TwistWithCovarianceStamped", ("/motion/camera_velocity",)),
-  "vehicle-speed": Signal("carState", "std_msgs/msg/Float64", ("/vehicle/speed",)),
-  "steering-angle": Signal("carState", "std_msgs/msg/Float64", ("/vehicle/steering_angle",)),
-  "steering-torque": Signal("carState", "std_msgs/msg/Float64", ("/vehicle/steering_torque",)),
-  "vehicle-yaw-rate": Signal("carState", "std_msgs/msg/Float64", ("/vehicle/yaw_rate",)),
-  "autonomy-flags": Signal("selfdriveState", "std_msgs/msg/Bool", ("/autonomy/enabled", "/autonomy/active", "/autonomy/engageable")),
   "predicted-path": Signal("modelV2", "nav_msgs/msg/Path", ("/model/path",)),
   "lane-lines": Signal("modelV2", "nav_msgs/msg/Path", tuple(f"/model/lane_lines/line_{i}" for i in range(4))),
   "road-edges": Signal("modelV2", "nav_msgs/msg/Path", tuple(f"/model/road_edges/edge_{i}" for i in range(2))),
   "lead-vehicles": Signal("modelV2", "visualization_msgs/msg/MarkerArray", ("/model/leads",)),
-  "target-acceleration": Signal("longitudinalPlan", "std_msgs/msg/Float64", ("/planning/target_acceleration",)),
+  # Exported by the calibration path in convert.py, not by signal_messages: ground_link -> device_flu -> model_flu.
+  "ground-link": Signal("extrinsicsCalibration", "tf2_msgs/msg/TFMessage", ("/tf",)),
 }
+# Signals produced from the extrinsic calibration path rather than signal_messages.
+CALIBRATION_SIGNALS = frozenset({"ground-link"})
 
 
 def header(timestamp: int, frame: str) -> Header:
@@ -91,8 +91,8 @@ def header(timestamp: int, frame: str) -> Header:
 
 
 def shift_timestamps(message: Message, offset: int) -> None:
-  if isinstance(message, (Float64, Bool)):
-    return
+  if isinstance(message, Float64):
+    return  # No header: the MCAP log time carries the (already shifted) timestamp.
   if isinstance(message, TFMessage):
     headers = [transform.header for transform in message.transforms]
   elif isinstance(message, MarkerArray):
@@ -117,31 +117,40 @@ def camera_info(timestamp: int, frame: str, camera: CameraConfig) -> CameraInfo:
   )
 
 
-def camera_transforms(data, timestamp: int, frames: Collection[str]) -> TFMessage:
+def camera_transforms(data, timestamp: int, frames: Collection[str], *, ground: bool = False) -> TFMessage:
   def rotation(values, name: str) -> np.ndarray:
     angles = np.asarray(tuple(values), dtype=np.float64)
     if angles.shape != (3,) or not np.all(np.isfinite(angles)):
       raise ValueError(f"Camera calibration {name} must contain three finite angles")
     return rot_from_euler(angles)
 
-  def transform(child: str, matrix: np.ndarray) -> TransformStamped:
+  def transform(parent: str, child: str, matrix: np.ndarray, translation: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> TransformStamped:
     w, x, y, z = quat_from_rot(matrix)
     return TransformStamped(
-      header(timestamp, "device_flu"), child,
-      Transform(Vector3(0.0, 0.0, 0.0), Quaternion(float(x), float(y), float(z), float(w))),
+      header(timestamp, parent), child,
+      Transform(Vector3(*translation), Quaternion(float(x), float(y), float(z), float(w))),
     )
 
   unknown = set(frames) - {"narrow_road_optical", "wide_road_optical"}
   if unknown:
     raise ValueError(f"Unsupported calibrated camera frames: {sorted(unknown)}")
   device_from_calib = rotation(data.rpyCalib, "rpyCalib")
-  transforms = [transform("model_flu", DEVICE_TO_FLU @ device_from_calib @ DEVICE_TO_FLU)]
+  device_from_model = DEVICE_TO_FLU @ device_from_calib @ DEVICE_TO_FLU
+  transforms = []
+  if ground:
+    heights = np.asarray(tuple(data.height), dtype=np.float64)
+    if heights.shape != (1,) or not np.isfinite(heights[0]) or heights[0] <= 0:
+      raise ValueError("Ground link requires extrinsicsCalibration.height to contain one finite, positive camera height")
+    # ground_link has the calibrated (model) frame's forward/left/up axes (pitch and yaw calibrated, roll follows the device),
+    # with its origin `height` below the device along that z axis; device_flu is its child, `height` above the origin.
+    transforms.append(transform("ground_link", "device_flu", device_from_model.T, (0.0, 0.0, float(heights[0]))))
+  transforms.append(transform("device_flu", "model_flu", device_from_model))
   for frame in sorted(frames):
     camera_from_device = np.eye(3)
     if frame == "wide_road_optical":
       camera_from_device = rotation(data.wideFromDeviceEuler, "wideFromDeviceEuler")
     # TF stores parent-from-child, the inverse of the UI's optical-from-device projection.
-    transforms.append(transform(frame, DEVICE_TO_FLU @ camera_from_device.T @ view_frame_from_device_frame.T))
+    transforms.append(transform("device_flu", frame, DEVICE_TO_FLU @ camera_from_device.T @ view_frame_from_device_frame.T))
   return TFMessage(transforms)
 
 
@@ -335,12 +344,16 @@ def signal_messages(signal: str, data, timestamp: int, skipped: Counter[str]) ->
         covariance_type,
       ),
     )
-  elif signal == "gps-velocity":
+  elif signal in ("gps-velocity", "gps-speed"):
     if not data.hasFix:
       skipped[f"{signal}: no GNSS fix"] += 1
       return
     velocity = vector(data.vNED)
-    yield topics[0], Vector3Stamped(header(timestamp, "gps_enu"), Vector3(velocity.y, velocity.x, -velocity.z))
+    if signal == "gps-velocity":
+      yield topics[0], Vector3Stamped(header(timestamp, "gps_enu"), Vector3(velocity.y, velocity.x, -velocity.z))
+    else:
+      # Magnitude of the same NED velocity that /gps/velocity publishes in ENU, so speed == |/gps/velocity| exactly.
+      yield topics[0], Float64(math.hypot(velocity.x, velocity.y, velocity.z))
   elif signal == "estimated-imu":
     if data.timestamp <= 0:
       raise ValueError("Estimated IMU is missing its state timestamp")
@@ -374,23 +387,6 @@ def signal_messages(signal: str, data, timestamp: int, skipped: Counter[str]) ->
     if data.timestampEof <= 0:
       raise ValueError("Camera velocity is missing its capture timestamp")
     yield topics[0], motion_twist(data.timestampEof, data.trans, data.rot, data.transStd, data.rotStd)
-  elif signal in ("vehicle-speed", "steering-angle", "steering-torque", "vehicle-yaw-rate", "target-acceleration"):
-    fields = {
-      "vehicle-speed": "vEgo",
-      "steering-angle": "steeringAngleDeg",
-      "steering-torque": "steeringTorque",
-      "vehicle-yaw-rate": "yawRate",
-      "target-acceleration": "aTarget",
-    }
-    value = float(getattr(data, fields[signal]))
-    if signal == "steering-angle":
-      value = math.radians(value)
-    if not math.isfinite(value):
-      raise ValueError(f"{signal}: non-finite scalar value")
-    yield topics[0], Float64(value)
-  elif signal == "autonomy-flags":
-    for topic, name in zip(topics, ("enabled", "active", "engageable"), strict=True):
-      yield topic, Bool(bool(getattr(data, name)))
   elif signal == "lead-vehicles":
     if data.timestampEof <= 0:
       raise ValueError("Lead predictions are missing their capture timestamp")

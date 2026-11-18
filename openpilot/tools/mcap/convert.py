@@ -22,8 +22,8 @@ from openpilot.tools.lib.filereader import FileReader
 from openpilot.tools.lib.logreader import LogReader, parse_indirect
 from openpilot.tools.lib.route import Route, Segment, SegmentRange
 from openpilot.tools.mcap.ros2 import (
-  NAV_SAT_COVARIANCE_TYPES, CompressedImage, PathMessage, SIGNALS, TYPESTORE, TimedMessage, camera_info, camera_transforms, header, log_messages,
-  path_marker, shift_timestamps,
+  CALIBRATION_SIGNALS, NAV_SAT_COVARIANCE_TYPES, CompressedImage, PathMessage, SIGNALS, TYPESTORE, TimedMessage, camera_info, camera_transforms,
+  header, log_messages, path_marker, shift_timestamps,
 )
 
 CAMERAS = {
@@ -43,9 +43,21 @@ CAMERA_INTRINSICS_SOURCE = (
   "openpilot DEVICE_CAMERAS nominal pinhole selected by the logged deviceState.deviceType and <camera>CameraState.sensor; " +
   "rlogs contain no lens calibration, so these are not measured for the individual device"
 )
+GROUND_FRAME = (
+  "ground_link: parent of device_flu with the calibrated (model) frame's forward/left/up axes (pitch and yaw calibrated, roll " +
+  "follows the device), origin extrinsicsCalibration.height below the device along that z axis; on notCar routes its rotation " +
+  "is a placeholder and its height usually is (calibrationd's startup value unless the platform exceeded 15 mph driving straight)"
+)
+GROUND_FRAME_UNCALIBRATED = "; APPROXIMATE: uncalibrated updates allowed, so its rotation and height may not have converged"
 GPS_FIX_COVARIANCE = (
-  "APPROXIMATED for u-blox fixes with hasFix: diag(hAcc^2, hAcc^2, vAcc^2) m^2 east/north/up from NAV-PVT accuracy estimates " +
-  "treated as 1-sigma (u-blox does not document their confidence level); UNKNOWN (zeros) without a fix or for other sources"
+  "APPROXIMATED for u-blox fixes with hasFix: the receiver's UBX-NAV-PVT hAcc/vAcc accuracy estimates (mm), which ubloxd logs " +
+  "in metres as gpsLocationExternal.horizontalAccuracy/verticalAccuracy, are treated as 1-sigma (u-blox does not document " +
+  "their confidence level) and squared into diag(hAcc^2, hAcc^2, vAcc^2) m^2 east/north/up, with hAcc on both horizontal " +
+  "axes and no cross terms; UNKNOWN (zeros) without a fix or for other sources"
+)
+GPS_SPEED = (
+  "std_msgs/Float64 m/s, no header (stamped by MCAP log time): magnitude of the 3D vNED velocity on /gps/velocity, " +
+  "including vertical; fixes only"
 )
 
 
@@ -163,7 +175,7 @@ def calibration_basis(events: list) -> str:
 def calibration_messages(
   events: list, cameras: Collection[str], skipped: Counter[str], *,
   allow_uncalibrated: bool = False, used_calibrations: Counter[str] | None = None,
-  basis: str = "unknown", used_bases: Counter[str] | None = None, reason: str = "camera-overlays",
+  basis: str = "unknown", used_bases: Counter[str] | None = None, reason: str = "camera-overlays", ground: bool = False,
 ) -> Iterator[TimedMessage]:
   frames = [CAMERAS[signal][2] for signal in cameras]
   for event in events:
@@ -176,7 +188,7 @@ def calibration_messages(
     if not event.valid or not allowed_status:
       skipped[f"{reason}: unavailable calibration"] += 1
       continue
-    transforms = camera_transforms(event.extrinsicsCalibration, event.logMonoTime, frames)
+    transforms = camera_transforms(event.extrinsicsCalibration, event.logMonoTime, frames, ground=ground)
     if used_calibrations is not None:
       used_calibrations[str(status)] += 1
     if used_bases is not None:
@@ -236,18 +248,21 @@ def convert_route(
   selected = set(topics)
   if not selected or selected - SIGNALS.keys():
     raise ValueError(f"Select supported signal names with --topics; unknown names: {sorted(selected - SIGNALS.keys())}")
-  if allow_uncalibrated_overlays and not (camera_overlays or camera_info):
-    raise ValueError("--allow-uncalibrated-overlays requires --camera-overlays or --camera-info")
+  ground = "ground-link" in selected
+  if allow_uncalibrated_overlays and not (camera_overlays or camera_info or ground):
+    raise ValueError("--allow-uncalibrated-overlays requires --camera-overlays, --camera-info, or the ground-link signal")
   cameras = sorted(selected & CAMERAS.keys())
   selected_road_cameras = sorted(selected & ROAD_CAMERAS.keys())
   if camera_overlays and not selected_road_cameras:
     raise ValueError("--camera-overlays requires at least one selected road camera")
   if camera_info and not cameras:
     raise ValueError("--camera-info requires at least one selected camera")
-  if allow_uncalibrated_overlays and not selected_road_cameras:
-    raise ValueError("--allow-uncalibrated-overlays requires a selected road camera; the cabin camera has no logged extrinsics")
+  if allow_uncalibrated_overlays and not (selected_road_cameras or ground):
+    raise ValueError("--allow-uncalibrated-overlays requires a selected road camera or ground-link; the cabin camera has no logged extrinsics")
   # Road cameras whose logged extrinsic calibration is exported as /tf; the cabin camera has no logged extrinsics.
   road_cameras = selected_road_cameras if camera_overlays or camera_info else []
+  # /tf carries the extrinsic calibration for calibrated road cameras and/or ground_link.
+  extrinsics = bool(road_cameras) or ground
   # Cameras that get CameraInfo: every selected camera with --camera-info, plus the road cameras required by overlays.
   info_cameras = sorted(set(cameras if camera_info else ()) | set(selected_road_cameras if camera_overlays else ()))
   route, segments = route_segments(identifier)
@@ -286,15 +301,16 @@ def convert_route(
         "model_frame": "model_flu: model coordinates with right/down axes flipped",
         "camera_overlays": str(camera_overlays).lower(),
         "camera_info": str(camera_info).lower(),
-        "camera_calibration_policy": ("allow_uncalibrated" if allow_uncalibrated_overlays else "calibrated_only") if road_cameras else "disabled",
+        "camera_calibration_policy": ("allow_uncalibrated" if allow_uncalibrated_overlays else "calibrated_only") if extrinsics else "disabled",
         "camera_projection": (
-          ("APPROXIMATE: uncalibrated logged rotations allowed; " if allow_uncalibrated_overlays else "") +
+          ("APPROXIMATE: uncalibrated logged rotations allowed; " if allow_uncalibrated_overlays and road_cameras else "") +
           "openpilot pinhole intrinsics and rotation-only projection frames; not surveyed physical camera translations"
         ),
         "path_orientation": "identity quaternions; these topics contain position geometry, not an attitude estimate",
         "gps_fix_covariance": GPS_FIX_COVARIANCE,
         "gps_velocity_frame": "gps_enu: east, north, up; linear velocity only",
-        "steering_torque_units": "native vehicle-specific CAN units, not Nm",
+        "gps_speed": GPS_SPEED,
+        **({"ground_frame": GROUND_FRAME + (GROUND_FRAME_UNCALIBRATED if allow_uncalibrated_overlays else "")} if ground else {}),
       },
     )
     for index, segment in enumerate(tqdm(segments, desc="Converting ROS 2", unit="segment")):
@@ -313,11 +329,13 @@ def convert_route(
           videos.append(video_messages(path, signal, segment.name.segment_num, events, camera_config=configs[signal]))
         else:
           videos.append(video_messages(path, signal, segment.name.segment_num, events))
-      telemetry = log_messages(events, selected - CAMERAS.keys(), skipped)
+      telemetry = log_messages(events, selected - CAMERAS.keys() - CALIBRATION_SIGNALS, skipped)
       calibration = calibration_messages(
         events, road_cameras, skipped, allow_uncalibrated=allow_uncalibrated_overlays, used_calibrations=used_calibrations,
-        basis=calibration_basis(events), used_bases=used_bases, reason="camera-overlays" if camera_overlays else "camera-info",
-      ) if road_cameras else iter(())
+        basis=calibration_basis(events), used_bases=used_bases, ground=ground,
+        # Label skipped updates by the feature that requires /tf: overlays, then ground-link, then (best-effort) camera-info.
+        reason="camera-overlays" if camera_overlays else "ground-link" if ground else "camera-info",
+      ) if extrinsics else iter(())
       messages = heapq.merge(telemetry, calibration, *videos, key=lambda item: item[0])
       for timestamp, topic, message in overlay_messages(messages) if camera_overlays else messages:
         timestamp += time_offset
@@ -337,24 +355,27 @@ def convert_route(
     missing_outputs = [topic for signal in sorted(selected) for topic in SIGNALS[signal].topics if not counts[topic]]
     # Overlays cannot be drawn without extrinsics, so they require /tf; --camera-info alone exports whatever calibration exists.
     required = (["/tf"] if camera_overlays else []) + [f"/camera/{CAMERAS[signal][0]}/camera_info" for signal in info_cameras]
-    missing_outputs.extend(topic for topic in required if not counts[topic])
+    missing_outputs.extend(topic for topic in required if not counts[topic] and topic not in missing_outputs)
     if skipped:
       cloudlog.warning(f"Skipped unavailable ROS 2 samples: {dict(skipped)}")
     if missing_outputs:
       raise ValueError(f"Selected topics produced no available samples: {missing_outputs}")
     if used_calibrations["uncalibrated"]:
+      subject = ("camera overlays" if camera_overlays else "camera calibration") if road_cameras else "ground_link"
       cloudlog.warning(
-        f"APPROXIMATE camera {'overlays' if camera_overlays else 'calibration'}: used {used_calibrations['uncalibrated']} valid but " +
-        "uncalibrated rotation updates; camera alignment is not guaranteed."
+        f"APPROXIMATE {subject}: used {used_calibrations['uncalibrated']} valid but uncalibrated extrinsics updates" +
+        ("; camera alignment is not guaranteed" if road_cameras else "") +
+        ("; ground_link's rotation and height may not have converged" if ground else "") + "."
       )
     if used_bases["notcar_placeholder"]:
       cloudlog.warning(
         f"PLACEHOLDER camera calibration: {used_bases['notcar_placeholder']} extrinsics updates come from a notCar route, where calibrationd " +
-        "reports calStatus=calibrated with a zero rotation without measuring; /tf matches openpilot's model frame, not the device mounting."
+        "reports calStatus=calibrated with a zero rotation without measuring; /tf matches openpilot's model frame, not the device mounting" +
+        (", and ground_link usually uses calibrationd's startup height." if ground else ".")
       )
     if road_cameras and not counts["/tf"]:
       cloudlog.warning("No usable extrinsic camera calibration was logged; camera optical frames are not connected to device_flu.")
-    if road_cameras:
+    if extrinsics:
       writer.add_metadata("camera_calibration_counts", {status: str(count) for status, count in sorted(used_calibrations.items())})
       writer.add_metadata("camera_calibration_basis", {basis: str(count) for basis, count in sorted(used_bases.items())})
     if info_cameras:
@@ -389,7 +410,8 @@ def main() -> None:
   )
   parser.add_argument(
     "--allow-uncalibrated-overlays", action="store_true",
-    help="Allow valid logged uncalibrated rotations for approximate alignment; requires --camera-overlays or --camera-info with a road camera",
+    help="Allow valid logged uncalibrated rotations for approximate alignment; requires --camera-overlays or --camera-info with a road camera, " +
+    "or the ground-link signal",
   )
   listing = parser.add_mutually_exclusive_group()
   listing.add_argument("--list-topics", action="store_true", help="List implemented signal mappings and standard ROS 2 types")
