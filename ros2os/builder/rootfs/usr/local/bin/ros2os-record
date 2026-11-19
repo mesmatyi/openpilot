@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# rosbag2 recorder used by ros2os-record.service (MCAP, zstd, 1 GB splits).
+set -eo pipefail
+. /opt/ros2os/setup.bash
+dir="${ROS2OS_RECORD_DIR:-/data/media/ros2_bags}"
+mkdir -p "$dir"
+topics=(${ROS2OS_RECORD_TOPICS})
+if [[ ${#topics[@]} -eq 0 ]]; then
+  topics=(/tf /tf_static /diagnostics /imu/data_raw /imu/temperature /gps/fix /gps/velocity /gps/twist
+          /gps/time_reference /can/rx /panda/state /hardware/state /audio/sound_pressure_db
+          /camera/narrowRoad/image_raw/compressed /camera/wideRoad/image_raw/compressed
+          /camera/cabin/image_raw/compressed /camera/narrowRoad/camera_info /camera/wideRoad/camera_info
+          /camera/cabin/camera_info)
+fi
+exec ros2 bag record -s mcap --storage-preset-profile zstd_fast --max-bag-size 1000000000 \
+  -o "$dir/$(date -u +%Y-%m-%d--%H-%M-%S)" "${topics[@]}"

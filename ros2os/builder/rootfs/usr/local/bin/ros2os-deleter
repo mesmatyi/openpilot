@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Delete the oldest recordings until /data has ROS2OS_MIN_FREE_PERCENT free (never the newest one).
+set -eo pipefail
+. /etc/ros2os/ros2os.env
+[[ -f /data/ros2os/ros2os.env ]] && . /data/ros2os/ros2os.env
+dir="${ROS2OS_RECORD_DIR:-/data/media/ros2_bags}"
+min="${ROS2OS_MIN_FREE_PERCENT:-10}"
+[[ -d "$dir" ]] || exit 0
+free_pct() { df --output=avail,size /data | awk 'NR==2 {printf "%d", 100*$1/$2}'; }
+while (( $(free_pct) < min )); do
+  mapfile -t bags < <(find "$dir" -mindepth 1 -maxdepth 1 -type d | sort)
+  (( ${#bags[@]} > 1 )) || break
+  echo "deleting ${bags[0]} ($(free_pct)% free)"
+  rm -rf "${bags[0]}"
+done

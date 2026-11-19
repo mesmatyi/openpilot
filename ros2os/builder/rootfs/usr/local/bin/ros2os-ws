@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Manage the persistent user workspace in /data/ros2_ws (survives image updates).
+#   ros2os-ws init     create /data/ros2_ws/src
+#   ros2os-ws build    colcon build (extra args are passed through)
+set -eo pipefail
+. /opt/ros2os/setup.bash
+ws=/data/ros2_ws
+case "${1:-}" in
+  init) mkdir -p "$ws/src"; echo "put packages in $ws/src, then run: ros2os-ws build" ;;
+  build) shift; cd "$ws"; colcon build --symlink-install "$@"
+         echo "built; new shells source it automatically. Restart the drivers with: sudo systemctl restart ros2os" ;;
+  *) echo "usage: ros2os-ws init|build [colcon args]"; exit 1 ;;
+esac

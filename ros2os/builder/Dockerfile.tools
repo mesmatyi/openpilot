@@ -1,0 +1,5 @@
+# Host-architecture helper image for the steps that work on disk images.
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      android-sdk-libsparse-utils ca-certificates curl e2fsprogs python3 tar xz-utils \
+    && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>comma_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files and default parameters that start every comma device driver, the TF tree and the Foxglove bridge.</description>
+  <maintainer email="noreply@example.com">ros2os maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>comma_description</exec_depend>
+  <exec_depend>comma_imu</exec_depend>
+  <exec_depend>comma_gnss</exec_depend>
+  <exec_depend>comma_panda</exec_depend>
+  <exec_depend>comma_hardware</exec_depend>
+  <exec_depend>comma_audio</exec_depend>
+  <exec_depend>comma_camera</exec_depend>
+  <exec_depend>foxglove_bridge</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Boot the other A/B slot (normally the stock AGNOS + openpilot the installer left in place).
+set -euo pipefail
+cur="$(abctl --boot_slot)"
+if [[ "$cur" == "_a" ]]; then target=1; name=_b; else target=0; name=_a; fi
+echo "current slot: $cur -> switching to slot $name"
+read -r -p "reboot into slot $name now? [y/N] " ans
+[[ "$ans" == [yY]* ]] || { echo "aborted"; exit 1; }
+sudo abctl --set_active "$target"
+sudo reboot

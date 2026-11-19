@@ -1,0 +1,4 @@
+# The repository-wide .gitignore excludes bin/ and *.d; the image overlay
+# (builder/rootfs/usr/local/bin, etc/*.d) needs both. build/ stays ignored.
+!bin/
+!*.d/

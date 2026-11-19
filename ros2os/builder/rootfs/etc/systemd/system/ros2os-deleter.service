@@ -1,0 +1,7 @@
+[Unit]
+Description=ros2os deleter: remove the oldest recordings when /data runs low
+
+[Service]
+Type=oneshot
+User=comma
+ExecStart=/usr/local/bin/ros2os-deleter

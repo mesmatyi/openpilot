@@ -1,0 +1,48 @@
+name: ros2os
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'ros2os/**'
+      - '.github/workflows/ros2os.yaml'
+  pull_request:
+    paths:
+      - 'ros2os/**'
+      - '.github/workflows/ros2os.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: ros2os-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit_tests:
+    name: driver, camera and installer tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libturbojpeg0-dev libgtest-dev android-sdk-libsparse-utils \
+          python3-pytest python3-numpy python3-requests e2fsprogs
+    - name: Python driver tests
+      working-directory: ros2os/ros2_ws/src
+      run: |
+        for p in comma_imu comma_gnss comma_panda comma_hardware comma_audio; do
+          PYTHONPATH=comma_hal:$p python3 -m pytest -q $p/test
+        done
+    - name: Installer and manifest tests
+      run: python3 -m pytest -q ros2os/installer/test_install.py
+    - name: comma_camera conversion tests
+      working-directory: ros2os/ros2_ws/src/comma_camera
+      run: |
+        g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude src/convert.cpp src/jpeg.cpp test/test_convert.cpp \
+          -lturbojpeg -lgtest -lgtest_main -pthread -o /tmp/test_convert
+        /tmp/test_convert
+    - name: Shell scripts
+      run: |
+        for f in ros2os/build.sh ros2os/builder/scripts/*.sh ros2os/builder/rootfs/usr/local/bin/*; do bash -n "$f"; done

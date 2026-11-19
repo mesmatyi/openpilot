@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>comma_audio</name>
+  <version>0.1.0</version>
+  <description>ROS 2 microphone driver for comma devices: raw 16 kHz audio and A-weighted sound pressure level (port of openpilot micd).</description>
+  <maintainer email="noreply@example.com">ros2os maintainers</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>comma_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- sounddevice (PortAudio bindings) is installed into the image by the ros2os builder -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

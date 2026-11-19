@@ -1,0 +1,86 @@
+# Default parameters for the comma device drivers.
+#
+# Override any of them without rebuilding the image by creating
+# /data/ros2os/params.yaml with the same structure; it is loaded after this file.
+# Node keys use /**/ so they also match when the drivers run in a namespace.
+
+/**/imu:
+  ros__parameters:
+    i2c_bus: 1
+    address: 106             # 0x6A (decimal: ROS parameter files do not parse hex)
+    odr_hz: 104              # integer Hz: 26, 52, 104, 208, 416, 833, 1660
+    accel_range_g: 2         # 2, 4, 8, 16   (openpilot: 2)
+    gyro_range_dps: 250      # 250, 500, 1000, 2000 (openpilot: 250)
+    use_interrupt: true      # data-ready IRQ on gpiochip0 line 84, hardware timestamps
+    frame_id: imu_link
+    axes: device_flu         # device_flu (x fwd, y left, z up) or sensor (raw chip axes)
+    temperature_rate_hz: 1.0
+    split_topics: false      # also publish imu/acceleration + imu/angular_velocity like tools/mcap
+    self_test: false
+
+/**/gnss:
+  ros__parameters:
+    backend: auto            # auto | ublox | quectel (auto: u-blox if /dev/ttyHS0 exists, like openpilot)
+    rate_hz: 10.0            # u-blox navigation rate; the Quectel engine runs at 1 Hz
+    frame_id: gps
+    enu_frame_id: gps_enu
+    stamp_source: receive    # receive (host time) | gnss (receiver UTC; use once the clock is synced)
+    uere_m: 4.0              # user equivalent range error for DOP-based NMEA covariances
+    publish_nmea: false
+    set_system_time: true    # set the clock from GNSS when it is invalid and NTP is not synced
+
+/**/panda:
+  ros__parameters:
+    serial: ""               # "" = first panda found (the internal one)
+    safety_mode: noOutput    # noOutput (listen only, ACKs), silent (bus monitor), elm327 (diagnostics),
+                             # allOutput (transmit anything - bench use only!)
+    safety_param: 0
+    can_speed_kbps: [500, 500, 500]
+    can_data_speed_kbps: [2000, 2000, 2000]
+    can_fd_auto: true
+    poll_rate_hz: 100.0
+    state_rate_hz: 2.0
+    flash_firmware: true     # flash the panda firmware bundled with the image if it differs
+    reset_on_start: true
+    power_save_when_ignition_off: false   # true matches openpilot (CAN transceivers sleep while the car is off)
+    control_fan: true
+    control_ir: true
+
+/**/hardware:
+  ros__parameters:
+    fan_policy: performance  # performance: onroad fan limits always; openpilot: low fan cap while ignition is off
+    power_protection: true   # power off after 30 h parked or on a low car battery (only when harnessed in a car)
+    low_voltage_threshold: 11.8
+    max_offroad_hours: 30.0
+    display: "off"           # off | on | unchanged  (no UI is drawn, so the panel is switched off by default)
+    data_path: /data
+
+/**/audio:
+  ros__parameters:
+    sample_rate: 16000
+    chunk_samples: 800
+    device: ""
+    frame_id: microphone
+
+/**/camera:
+  ros__parameters:
+    vipc_server: camerad
+    cameras: [narrowRoad, wideRoad, cabin]
+    encoding: bgr8           # nv12 (no conversion), mono8, rgb8, bgr8
+    downscale: 1             # 1 = full resolution, 2 = half
+    jpeg_quality: 80
+    jpeg_rate_divider: 1     # JPEG every Nth frame (camerad runs at 20 Hz)
+    stamp: sof               # sof (start of frame, as tools/mcap) | eof
+    narrowRoad:
+      focal_length: 0.0      # > 0 overrides openpilot's nominal value [px]
+    wideRoad:
+      focal_length: 0.0
+    cabin:
+      focal_length: 0.0
+
+/**/foxglove_bridge:
+  ros__parameters:
+    port: 8765
+    address: 0.0.0.0
+    send_buffer_limit: 50000000
+    max_qos_depth: 10

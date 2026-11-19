@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>comma_panda</name>
+  <version>0.1.0</version>
+  <description>ROS 2 driver for the panda, the CAN / CAN FD interface inside comma devices (SPI on comma 3X / four, USB for external pandas). Publishes CAN traffic and panda health, accepts CAN transmit requests, and drives the fan and IR LEDs attached to the panda.</description>
+  <maintainer email="noreply@example.com">ros2os maintainers</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>comma_msgs</exec_depend>
+  <exec_depend>comma_hal</exec_depend>
+  <!-- the `panda` and `opendbc` Python packages come from this repository's
+       submodules and are installed into the image by the ros2os builder -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

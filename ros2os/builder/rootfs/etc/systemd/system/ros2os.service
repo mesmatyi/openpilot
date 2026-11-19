@@ -1,0 +1,17 @@
+[Unit]
+Description=ros2os: comma device ROS 2 drivers (comma_bringup)
+After=network.target ros2os-hwinit.service ros2os-camerad.service
+Wants=ros2os-hwinit.service ros2os-camerad.service
+
+[Service]
+User=comma
+ExecStart=/usr/local/bin/ros2os-launch
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

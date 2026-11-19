@@ -1,0 +1,15 @@
+[Unit]
+Description=openpilot camerad: Spectra ISP driver for the comma cameras (read by comma_camera over VisionIPC)
+After=ros2os-hwinit.service
+Wants=ros2os-hwinit.service
+
+[Service]
+User=comma
+ExecStart=/opt/ros2os/openpilot/bin/camerad
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

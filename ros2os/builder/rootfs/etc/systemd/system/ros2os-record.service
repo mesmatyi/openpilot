@@ -1,0 +1,15 @@
+[Unit]
+Description=ros2os recorder: rosbag2 (MCAP, zstd) of the driver topics to /data/media/ros2_bags
+After=ros2os.service
+Wants=ros2os.service
+
+[Service]
+User=comma
+ExecStart=/usr/local/bin/ros2os-record
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

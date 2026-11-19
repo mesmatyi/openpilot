@@ -1,0 +1,11 @@
+[Unit]
+Description=ros2os hostname (comma-<serial>, published over mDNS)
+Before=avahi-daemon.service network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/ros2os-hostname
+
+[Install]
+WantedBy=multi-user.target

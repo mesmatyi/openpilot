@@ -1,0 +1,13 @@
+[Unit]
+Description=ros2os hardware setup (CPU/GPU/IRQ tuning, fan supply, device permissions)
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Before=ros2os-camerad.service ros2os.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/ros2os-hwinit
+
+[Install]
+WantedBy=multi-user.target

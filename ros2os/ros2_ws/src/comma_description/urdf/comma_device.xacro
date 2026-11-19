@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!--
+  Sensor frames of a comma device (comma four "mici", comma 3X "tizi").
+
+  device_flu            device body: x forward (out of the road cameras), y left, z up (REP 103)
+  imu_link              axes identical to device_flu; comma_imu rotates the LSM6DS3 chip axes into it
+  gps                   GNSS antenna (NavSatFix frame, as in tools/mcap exports)
+  gps_enu               ENU-aligned frame for GNSS velocity (orientation is not a body rotation; see README)
+  narrow_road_optical   optical frames (x right, y down, z forward); names match tools/mcap
+  wide_road_optical
+  cabin_optical         faces backwards, towards the driver
+  microphone, panda
+
+  Origins coincide: like openpilot itself, these are rotation-only frames; the
+  physical offsets between the sensors (a few cm) are not surveyed. The wide
+  camera's per-unit calibration (openpilot's wideFromDeviceEuler) is not applied.
+
+  Use it inside a robot description with:
+    <xacro:include filename="$(find comma_description)/urdf/comma_device.xacro"/>
+    <xacro:comma_device prefix="" parent="base_link">
+      <origin xyz="1.2 0 1.3" rpy="0 0 0"/>
+    </xacro:comma_device>
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="pi_2" value="1.5707963267948966"/>
+
+  <xacro:macro name="comma_fixed" params="prefix parent child xyz:='0 0 0' rpy:='0 0 0'">
+    <link name="${prefix}${child}"/>
+    <joint name="${prefix}${child}_joint" type="fixed">
+      <parent link="${prefix}${parent}"/>
+      <child link="${prefix}${child}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="comma_device" params="prefix:='' parent:='' *origin">
+    <link name="${prefix}device_flu"/>
+    <xacro:if value="${parent != ''}">
+      <joint name="${prefix}device_mount_joint" type="fixed">
+        <parent link="${parent}"/>
+        <child link="${prefix}device_flu"/>
+        <xacro:insert_block name="origin"/>
+      </joint>
+    </xacro:if>
+
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="imu_link"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="gps"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="gps_enu"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="microphone"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="panda"/>
+
+    <!-- camera links follow REP 103 (x along the optical axis); optical frames follow REP 103's camera convention -->
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="narrow_road_camera_link"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="narrow_road_camera_link" child="narrow_road_optical" rpy="${-pi_2} 0 ${-pi_2}"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="wide_road_camera_link"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="wide_road_camera_link" child="wide_road_optical" rpy="${-pi_2} 0 ${-pi_2}"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="device_flu" child="cabin_camera_link" rpy="0 0 ${2 * pi_2}"/>
+    <xacro:comma_fixed prefix="${prefix}" parent="cabin_camera_link" child="cabin_optical" rpy="${-pi_2} 0 ${-pi_2}"/>
+  </xacro:macro>
+</robot>

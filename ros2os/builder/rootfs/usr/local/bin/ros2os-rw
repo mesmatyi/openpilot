@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Make the root filesystem writable until the next reboot (e.g. for apt install).
+# Changes live only in this slot and are replaced by the next image update; prefer /data for your files.
+set -e
+sudo mount -o remount,rw /
+echo "/ is writable until reboot"

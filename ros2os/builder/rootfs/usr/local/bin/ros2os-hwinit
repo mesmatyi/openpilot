@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Hardware setup normally done by openpilot's hardwared (HARDWARE.initialize_hardware() and
+# set_power_save(False)), plus permissions so the drivers can run as the comma user.
+set -u
+w() { [[ -e "$2" ]] && echo "$1" > "$2" 2>/dev/null; return 0; }
+
+irqs_for() {  # IRQ numbers whose action list contains exactly $1
+  local n
+  while read -r n _; do
+    n="${n%:}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    tr ',' '\n' < "/sys/kernel/irq/$n/actions" 2>/dev/null | grep -qx "$1" && echo "$n"
+  done < /proc/interrupts
+}
+affine() { local cpu=$1; shift; for a in "$@"; do for i in $(irqs_for "$a"); do w "$cpu" "/proc/irq/$i/smp_affinity_list"; done; done; }
+
+# CPUs: all cores online, performance governor, max frequency capped like openpilot (1689.6 MHz)
+for c in 4 5 6 7; do w 1 "/sys/devices/system/cpu/cpu$c/online"; done
+for p in 0 4; do
+  w performance "/sys/devices/system/cpu/cpufreq/policy$p/scaling_governor"
+  w 1689600 "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq"
+done
+
+# IRQs: keep the big cluster free by default, pin drivers like openpilot does
+w f /proc/irq/default_smp_affinity
+affine 1 msm_vidc i2c_geni
+affine 5 fts_ts msm_drm
+affine 7 kgsl-3d0
+affine 6 a5 cci cpas_camnoc cpas-cdm csid ife csid-lite ife-lite
+affine 3 spi_geni
+if pid="$(pgrep -f spi0 | head -1)"; then chrt -f -p 1 "$pid" 2>/dev/null; taskset -pc 3 "$pid" >/dev/null 2>&1; fi
+
+# GPU and memory bus
+g=/sys/class/kgsl/kgsl-3d0
+w 1 $g/min_pwrlevel; w 1 $g/max_pwrlevel
+w 1 $g/force_bus_on; w 1 $g/force_clk_on; w 1 $g/force_rail_on
+w 1000 $g/idle_timer; w performance $g/devfreq/governor; w 710 $g/max_clock_mhz
+for d in "soc:qcom,cpubw" "soc:qcom,memlat-cpu0" "soc:qcom,memlat-cpu4"; do w performance "/sys/class/devfreq/$d/governor"; done
+w N /sys/kernel/debug/msm_vidc/clock_scaling
+w Y /sys/kernel/debug/msm_vidc/disable_thermal_mitigation
+
+# GPIOs used by the drivers: fan supply on, panda reset/boot, GNSS power
+gp=/sys/class/gpio
+for pin in 49 124 134 32 33 34; do
+  [[ -d $gp/gpio$pin ]] || w "$pin" $gp/export
+  chown comma "$gp/gpio$pin/value" "$gp/gpio$pin/direction" 2>/dev/null
+done
+w out $gp/gpio49/direction; w 1 $gp/gpio49/value   # SOM_ST_IO keeps the fan running until shutdown
+
+# sysfs nodes written by comma_hardware (IR LEDs, display)
+for f in /sys/class/leds/led:torch_2/brightness /sys/class/leds/led:switch_2/brightness \
+         /sys/class/backlight/panel0-backlight/bl_power /sys/class/backlight/panel0-backlight/brightness; do
+  chown comma "$f" 2>/dev/null
+done
+
+# persistent ros2os state on /data
+if mountpoint -q /data; then
+  install -d -o comma -g "$(id -gn comma)" /data/ros2os /data/media /data/media/ros2_bags
+fi
+exit 0

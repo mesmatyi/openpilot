@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!-- Standalone description: the device is the root of its own TF tree. -->
+<robot name="comma_device" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="prefix" default=""/>
+  <xacro:include filename="$(find comma_description)/urdf/comma_device.xacro"/>
+  <xacro:comma_device prefix="$(arg prefix)" parent="">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:comma_device>
+</robot>

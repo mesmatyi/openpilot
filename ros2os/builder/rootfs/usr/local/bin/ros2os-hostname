@@ -1,0 +1,5 @@
+#!/bin/sh
+# hostname comma-<serial>, so the device is reachable as comma-<serial>.local (avahi)
+serial="$(sed -n 's/.*androidboot.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)"
+[ -n "$serial" ] && hostnamectl set-hostname --transient "comma-$serial"
+exit 0

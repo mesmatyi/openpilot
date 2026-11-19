@@ -1,0 +1,11 @@
+# build context is the repository root
+**/.git
+**/__pycache__
+**/*.pyc
+**/.venv
+**/node_modules
+ros2os/build
+ros2os/ros2_ws/build
+ros2os/ros2_ws/install
+ros2os/ros2_ws/log
+.sconsign.dblite

@@ -1,0 +1,19 @@
+#!/bin/sh
+# DDS only advertises the interfaces that existed when a node started. When a network
+# interface comes up (e.g. Wi-Fi connects after boot), restart the drivers so remote
+# machines can discover them. Rate-limited to once per 10 minutes; disable with
+# ROS2OS_RESTART_ON_NETWORK=0 in /data/ros2os/ros2os.env.
+iface="$1"; action="$2"
+[ "$action" = "up" ] || exit 0
+case "$iface" in lo|"") exit 0 ;; esac
+. /etc/ros2os/ros2os.env
+[ -f /data/ros2os/ros2os.env ] && . /data/ros2os/ros2os.env
+[ "${ROS2OS_RESTART_ON_NETWORK:-1}" = "1" ] || exit 0
+systemctl is-active --quiet ros2os.service || exit 0
+stamp=/run/ros2os-network-restart
+now=$(date +%s)
+last=$(cat "$stamp" 2>/dev/null || echo 0)
+[ $((now - last)) -ge 600 ] || exit 0
+echo "$now" > "$stamp"
+logger -t ros2os "network interface $iface up, restarting ros2os drivers"
+systemctl restart ros2os.service

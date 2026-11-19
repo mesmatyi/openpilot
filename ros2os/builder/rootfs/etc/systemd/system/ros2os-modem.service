@@ -1,0 +1,13 @@
+[Unit]
+Description=ros2os LTE modem manager (openpilot modem.py)
+After=ros2os-hwinit.service
+ConditionPathExists=/dev/modem_at0
+
+[Service]
+User=comma
+ExecStart=/usr/bin/python3 /opt/ros2os/openpilot/modem.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

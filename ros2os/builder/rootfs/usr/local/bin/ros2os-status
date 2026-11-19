@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Overview of the ros2os services and what the device publishes.
+. /opt/ros2os/setup.bash 2>/dev/null
+. /etc/ros2os/build-info 2>/dev/null
+echo "ros2os ${ROS2OS_VERSION:-?} (${ROS2OS_COMMIT:-?}), AGNOS ${AGNOS_VERSION:-?}, ROS 2 $ROS_DISTRO, $(hostname), slot $(abctl --boot_slot 2>/dev/null)"
+echo "RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION ROS_DOMAIN_ID=$ROS_DOMAIN_ID addresses: $(hostname -I 2>/dev/null)"
+echo
+for u in ros2os-hwinit ros2os-camerad ros2os ros2os-modem ros2os-record; do
+  printf '  %-16s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null) ($(systemctl is-enabled "$u" 2>/dev/null))"
+done
+echo
+echo "nodes:"; timeout 10 ros2 node list 2>/dev/null | sed 's/^/  /'
+echo "topics:"; timeout 10 ros2 topic list -t 2>/dev/null | sed 's/^/  /'
+echo
+echo "logs: journalctl -u ros2os -f        foxglove: ws://$(hostname).local:8765"

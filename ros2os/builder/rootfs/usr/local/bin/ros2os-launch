@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Entry point of ros2os.service: start the device drivers.
+# /data/ros2os/launch.py, if present, replaces the default launch file (it can include comma.launch.py).
+set -eo pipefail
+. /opt/ros2os/setup.bash
+if [[ -f /data/ros2os/launch.py ]]; then
+  echo "ros2os: using /data/ros2os/launch.py"
+  exec ros2 launch /data/ros2os/launch.py
+fi
+# shellcheck disable=SC2086
+exec ros2 launch comma_bringup comma.launch.py ${ROS2OS_LAUNCH_ARGS}
